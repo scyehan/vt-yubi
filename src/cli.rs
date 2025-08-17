@@ -144,9 +144,7 @@ pub fn get_hostname() -> String {
 
 pub fn is_ip_address(addr: &str) -> bool {
     let host = addr.split(':').next().unwrap_or(addr);
-    host.split('.').count() == 4 && host.split('.').all(|num| {
-        num.parse::<u8>().is_ok()
-    })
+    host.split('.').count() == 4 && host.split('.').all(|num| num.parse::<u8>().is_ok())
 }
 
 pub async fn read(vt_client: VTClient, vt: String) -> Result<()> {
@@ -232,6 +230,7 @@ async fn decrypt_from_multi_str(
 
 pub async fn inject(
     vt_client: VTClient,
+    replace_file: Option<String>,
     input_file: Option<String>,
     output_file: Option<String>,
     timeout: u32,
@@ -251,17 +250,17 @@ pub async fn inject(
         )
     };
 
-    let input_file_content = if let Some(input_file) = input_file {
-        debug!("Reading input file: {}", input_file);
-        if !std::path::Path::new(&input_file).exists() {
-            return Err(anyhow::anyhow!("Input file does not exist: {}", input_file));
-        }
-        std::fs::read_to_string(&input_file)
-            .with_context(|| format!("Failed to read input file: {}", input_file))?
-    } else {
-        debug!("No input file provided, using empty content");
-        String::new()
-    };
+    let read_file = replace_file
+        .as_ref()
+        .or(input_file.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("No input file or replace file provided"))?;
+
+    debug!("Reading file: {}", read_file);
+    if !std::path::Path::new(&read_file).exists() {
+        return Err(anyhow::anyhow!("File does not exist: {}", read_file));
+    }
+    let input_file_content = std::fs::read_to_string(&read_file)
+        .with_context(|| format!("Failed to read file: {}", read_file))?;
     args.push(input_file_content);
 
     let env_vars: HashMap<String, String> = env::vars().collect();
@@ -277,44 +276,62 @@ pub async fn inject(
         env::set_var(key, value);
     }
 
+    if let Some(replace_file_path) = &replace_file {
+        // Create a backup of the original file
+        let backup_path = format!("{}.vt", replace_file_path);
+        std::fs::copy(replace_file_path, &backup_path)
+            .with_context(|| format!("Failed to backup file to: {}", backup_path))?;
+        debug!("Created backup at: {}", backup_path);
+    }
+
     let output_file_content = decrypted_args.pop().unwrap();
-    if let Some(output_file_path) = &output_file {
+    if let Some(replace_file_path) = &replace_file {
+        std::fs::write(replace_file_path, &output_file_content)
+            .with_context(|| format!("Failed to write to replace file: {}", replace_file_path))?;
+        debug!("Content written to replace file: {}", replace_file_path);
+    } else if let Some(output_file_path) = &output_file {
         std::fs::write(output_file_path, &output_file_content)
             .with_context(|| format!("Failed to write to output file: {}", output_file_path))?;
-        debug!("Content written to: {}", output_file_path);
+        debug!("Content written to output file: {}", output_file_path);
     } else {
         print!("{}", output_file_content);
     }
 
-    if timeout > 0 {
-        if let Some(file_to_delete) = output_file {
-            // Fork the process to handle file deletion in the background.
-            // This is `unsafe` because it can violate Rust's memory safety guarantees,
-            // especially in a multi-threaded context. However, for our simple case
-            // where the child process only sleeps and deletes a file, it's acceptable.
-            let pid = unsafe { libc::fork() };
+    if timeout > 0 && (output_file.is_some() || replace_file.is_some()) {
+        // Fork the process to handle file deletion in the background.
+        // This is `unsafe` because it can violate Rust's memory safety guarantees,
+        // especially in a multi-threaded context. However, for our simple case
+        // where the child process only sleeps and deletes a file, it's acceptable.
+        let pid = unsafe { libc::fork() };
 
-            if pid > 0 {
-                // Parent process: Continue to the exec call.
-                debug!("Spawned cleanup process with PID: {}", pid);
-            } else if pid == 0 {
-                // Child process: Sleep, delete the file, and exit.
-                // Using std::thread::sleep instead of tokio::time::sleep is safer after a fork.
-                std::thread::sleep(std::time::Duration::from_secs(timeout as u64));
-                if let Err(e) = std::fs::remove_file(&file_to_delete) {
-                    // The child is detached, so logging might not be visible.
-                    // For now, we'll just note that the deletion failed.
+        if pid > 0 {
+            // Parent process: Continue to the exec call.
+            debug!("Spawned cleanup process with PID: {}", pid);
+        } else if pid == 0 {
+            // Child process: Sleep, then restore backup or delete output file, and exit.
+            // Using std::thread::sleep instead of tokio::time::sleep is safer after a fork.
+            std::thread::sleep(std::time::Duration::from_secs(timeout as u64));
+
+            if let Some(replace_file_path) = replace_file.as_ref() {
+                // Restore the backup file
+                let backup_path = format!("{}.vt", replace_file_path);
+                if let Err(e) = std::fs::rename(&backup_path, replace_file_path) {
+                    eprintln!("Child process failed to restore backup file: {}", e);
+                }
+            } else if let Some(output_file_path) = output_file.as_ref() {
+                // Delete the output file
+                if let Err(e) = std::fs::remove_file(output_file_path) {
                     eprintln!("Child process failed to delete output file: {}", e);
                 }
-                // The child's work is done, it must exit.
-                std::process::exit(0);
-            } else {
-                // Fork failed.
-                return Err(anyhow::anyhow!(
-                    "Failed to fork cleanup process: {}",
-                    std::io::Error::last_os_error()
-                ));
             }
+            // The child's work is done, it must exit.
+            std::process::exit(0);
+        } else {
+            // Fork failed.
+            return Err(anyhow::anyhow!(
+                "Failed to fork cleanup process: {}",
+                std::io::Error::last_os_error()
+            ));
         }
     }
 

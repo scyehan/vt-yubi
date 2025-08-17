@@ -42,6 +42,13 @@ enum Commands {
     },
     /// Read env/file and decrypt vt protocol, output to output-file or standard output
     Inject {
+        #[arg(
+            short = 'r',
+            long = "replace-file",
+            help = "Path to the file to replace with the decrypted vt protocol"
+        )]
+        replace_file: Option<String>,
+
         #[arg(short = 'i', long = "input-file", help = "Path to the input file")]
         input_file: Option<String>,
 
@@ -133,6 +140,7 @@ async fn main() {
             cli::read(vt_client, vt.to_string()).await
         }
         Commands::Inject {
+            replace_file,
             input_file,
             output_file,
             timeout,
@@ -141,6 +149,7 @@ async fn main() {
             let vt_client = VTClient::new(cli.addr.clone(), cli.auth);
             cli::inject(
                 vt_client,
+                replace_file.clone(),
                 input_file.clone(),
                 output_file.clone(),
                 *timeout,
