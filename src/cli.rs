@@ -236,6 +236,14 @@ pub async fn inject(
     timeout: u32,
     mut args: Vec<String>,
 ) -> Result<()> {
+    if replace_file.is_some() {
+        if input_file.is_some() || output_file.is_some() {
+            return Err(anyhow::anyhow!(
+                "Cannot specify both replace file and input file or output file"
+            ));
+        }
+    }
+
     let original_command = args.join(" ");
     debug!("Original command: {}", original_command);
     let original_command = if original_command.is_empty() {
