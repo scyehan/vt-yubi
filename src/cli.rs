@@ -258,17 +258,14 @@ pub async fn inject(
         )
     };
 
-    let read_file = replace_file
-        .as_ref()
-        .or(input_file.as_ref())
-        .ok_or_else(|| anyhow::anyhow!("No input file or replace file provided"))?;
-
-    debug!("Reading file: {}", read_file);
-    if !std::path::Path::new(&read_file).exists() {
-        return Err(anyhow::anyhow!("File does not exist: {}", read_file));
-    }
-    let input_file_content = std::fs::read_to_string(&read_file)
-        .with_context(|| format!("Failed to read file: {}", read_file))?;
+    let input_file_content = match replace_file.as_ref().or(input_file.as_ref()) {
+        Some(file) => {
+            debug!("Reading file: {}", file);
+            std::fs::read_to_string(file)
+                .with_context(|| format!("Failed to read file: {}", file))?
+        }
+        None => String::new(),
+    };
     args.push(input_file_content);
 
     let env_vars: HashMap<String, String> = env::vars().collect();
@@ -305,7 +302,25 @@ pub async fn inject(
         print!("{}", output_file_content);
     }
 
-    if timeout > 0 && (output_file.is_some() || replace_file.is_some()) {
+    // Helper function to restore backup or delete output file
+    let restore_backup = |replace_file_path: Option<&String>, output_file_path: Option<&String>| {
+        if let Some(replace_file_path) = replace_file_path {
+            let backup_path = format!("{}.vt", replace_file_path);
+            if let Err(e) = std::fs::rename(&backup_path, replace_file_path) {
+                eprintln!("Failed to restore backup file: {}", e);
+            } else {
+                debug!("Restored backup file: {}", replace_file_path);
+            }
+        } else if let Some(output_file_path) = output_file_path {
+            if let Err(e) = std::fs::remove_file(output_file_path) {
+                eprintln!("Failed to delete output file: {}", e);
+            } else {
+                debug!("Deleted output file: {}", output_file_path);
+            }
+        }
+    };
+
+    let cleanup_pid = if timeout > 0 && (output_file.is_some() || replace_file.is_some()) {
         // Fork the process to handle file deletion in the background.
         // This is `unsafe` because it can violate Rust's memory safety guarantees,
         // especially in a multi-threaded context. However, for our simple case
@@ -315,6 +330,7 @@ pub async fn inject(
         if pid > 0 {
             // Parent process: Continue to the exec call.
             debug!("Spawned cleanup process with PID: {}", pid);
+            Some(pid)
         } else if pid == 0 {
             // Child process: Sleep, then restore backup or delete output file, and exit.
             // Using std::thread::sleep instead of tokio::time::sleep is safer after a fork.
@@ -341,7 +357,9 @@ pub async fn inject(
                 std::io::Error::last_os_error()
             ));
         }
-    }
+    } else {
+        None
+    };
 
     if decrypted_args.is_empty() {
         debug!("No command to execute, exiting.");
@@ -354,7 +372,26 @@ pub async fn inject(
 
     debug!("Executing command: {} with args: {:?}", command, args);
 
+    // If exec() fails, we need to immediately restore the backup and kill the cleanup child
+    // exec() never returns if successful (it replaces the process), so if we reach the code below,
+    // it means exec() failed
     let err = exec::Command::new(command).args(args).exec();
+
+    // If we reach here, exec() failed - immediately restore backup and kill cleanup child
+    if let Some(cleanup_pid) = cleanup_pid {
+        // Kill the cleanup child process immediately since exec failed
+        unsafe {
+            libc::kill(cleanup_pid, libc::SIGTERM);
+        }
+        // Wait for the child to exit to avoid zombie processes
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(cleanup_pid, &mut status, 0);
+        }
+    }
+
+    // Immediately restore the backup since exec failed
+    restore_backup(replace_file.as_ref(), output_file.as_ref());
 
     Err(anyhow::anyhow!("Failed to execute command: {}", err))
 }
