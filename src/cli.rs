@@ -249,13 +249,24 @@ pub async fn inject(
     let original_command = if original_command.is_empty() {
         "[inject]".to_string()
     } else {
-        format!(
-            "[inject] {}",
-            regex::Regex::new(r"vt://[^/]+/[A-Za-z0-9_-]+")
-                .unwrap()
-                .replace_all(&original_command, "vt://xxxx")
-                .to_string()
-        )
+        // Replace newlines and collapse whitespace for cleaner display
+        let normalized = regex::Regex::new(r"\s+")
+            .unwrap()
+            .replace_all(&original_command, " ")
+            .to_string();
+        let sanitized = regex::Regex::new(r"vt://[^/]+/[A-Za-z0-9_-]+")
+            .unwrap()
+            .replace_all(&normalized, "vt://***")
+            .to_string();
+        // Truncate long commands to keep the display readable (UTF-8 safe)
+        const MAX_CMD_LEN: usize = 60;
+        let truncated = if sanitized.chars().count() > MAX_CMD_LEN {
+            let s: String = sanitized.chars().take(MAX_CMD_LEN).collect();
+            format!("{}...", s)
+        } else {
+            sanitized
+        };
+        format!("[inject] {}", truncated)
     };
 
     let input_file_content = match replace_file.as_ref().or(input_file.as_ref()) {
