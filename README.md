@@ -1,32 +1,131 @@
-# Vault, a simple KMS solution based on macOS keychain
+# VT (Vault)
 
-this program will have several subcommands as below:
+A simple KMS solution based on macOS keychain. No plaintext secrets, explicit authentication everywhere.
 
-- serve: start a https server which will interact with system keychain for encryption/decryption
-- init: initialize a gpg keypair, a passphrase which will be used by server
-- create: will read plain text and output encrypted message for you
-- read: decrypted a vt protocol
-- inject: read env/file and decrypt vt protocol
+## Features
 
-# Secret management
+- Secure secret storage using macOS keychain
+- AES-256-GCM encryption
+- Touch ID / local authentication for decrypt operations
+- TOTP support for time-based one-time passwords
+- Environment variable and file injection with automatic cleanup
 
-It'll create two secrets when do initialize, called `passcode` and `passphrase`. The `passcode` is a random bytes which will derive a secret used for encrypting the `passphrase`. The `passphrase` is the real cipher key used in production to do the encryption and decryption. The plain `passcode` and encrypted `passphrase` will be created and saved in macOS keychain when run `vt init`. The `auth_token` is also created when run `vt init`. `VT_AUTH` environment variable as auth_token will be read by `vt` and set in http header for authorization and body encrypt usage. `auth_token` will be appended to `passcode` before saved in macOS keychain.
+## Installation
 
-The `vt` command is managing user interface which provide encrypt/decrypt and run command. The process do the real work is a server run by `vt serve`. `vt` command is communicating with this server to provide vault abilities. Vault server has restrict permission limitations, you should ensure these environment to keep vault server running well.
+```bash
+cargo build --release
+cp target/release/vt /usr/local/bin/
+```
 
-1. run `vt serve` from the same user which do the `vt init`
-2. keep `vt` executable binary located in the same absolute path when do the `vt init`
+## Quick Start
 
-# vt protocol
+1. Initialize the vault (creates keychain entries):
+   ```bash
+   vt init
+   ```
 
-`vt://{location}/{data}`
+2. Start the KMS server:
+   ```bash
+   vt serve
+   ```
 
-- location: mac/1p/yubikey which location will the secrets be stored, only mac supported for mac
-- data: encrypted data. the first char of data is the type, 0 for raw & 1 for totp
+3. Export the auth token (shown during `vt init`):
+   ```bash
+   export VT_AUTH=<your_auth_token>
+   ```
 
-# Usage
+4. Create and read secrets:
+   ```bash
+   # Create an encrypted secret (reads from stdin)
+   vt create
 
-1. run `vt init` in mac
-2. run `vt serve` to start kms
-3. export VT_AUTH= created in client console
-4. enjoy `vt read` & `vt inject`
+   # Read/decrypt a vt protocol string
+   vt read vt://mac/0xxxxx
+   ```
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `init` | (macOS) Initialize passcode and passphrase in keychain |
+| `serve` | (macOS) Start the KMS HTTP server |
+| `create` | Read plaintext from stdin, output encrypted vt protocol |
+| `read <vt>` | Decrypt a vt protocol string |
+| `inject` | Decrypt vt protocols in env/files, optionally run a command |
+| `secret export` | (macOS) Export the encrypted master secret |
+| `secret import` | (macOS) Import an encrypted master secret |
+| `secret rotate-passcode` | (macOS) Rotate the passcode for the master secret |
+
+### Inject Command
+
+The `inject` command supports several modes:
+
+```bash
+# Replace vt:// patterns in a file
+vt inject -r config.yaml
+
+# Read from input file, write to output file, then run command
+vt inject -i template.env -o .env -- myapp --config .env
+
+# Inject env vars and run command (output file auto-deleted after timeout)
+vt inject -o secrets.env -t 5 -- ./run.sh
+```
+
+Options:
+- `-r, --replace-file <FILE>`: Replace vt protocols in-place
+- `-i, --input-file <FILE>`: Input file with vt protocols
+- `-o, --output-file <FILE>`: Output file for decrypted content
+- `-t, --timeout <SECONDS>`: Seconds before deleting output file (default: 2)
+
+## VT Protocol Format
+
+```
+vt://{location}/{type}{data}
+```
+
+- **location**: Secret storage location (`mac` for macOS keychain)
+- **type**: `0` for raw secrets, `1` for TOTP
+- **data**: Base64 URL-safe encoded encrypted data
+
+Example: `vt://mac/0SGVsbG8gV29ybGQ`
+
+## Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `VT_ADDR` | Server address | `127.0.0.1:5757` |
+| `VT_AUTH` | Authentication token (from `vt init`) | - |
+| `RUST_LOG` | Log level | `info` (release) / `debug` (dev) |
+
+## Secret Management
+
+VT creates two keychain entries during initialization:
+
+1. **passcode**: Random bytes + auth_token, used to derive the passphrase encryption key
+2. **passphrase**: The actual encryption key (encrypted with key derived from passcode + USER + binary path)
+
+### Security Requirements
+
+- Run `vt serve` from the same user who ran `vt init`
+- Keep the `vt` binary at the same absolute path as during `vt init`
+- The server requires Touch ID or local authentication for decrypt operations
+
+## Architecture
+
+```
+┌─────────────┐     HTTP      ┌─────────────┐     ┌─────────────┐
+│  vt client  │ ─────────────▶│  vt serve   │────▶│   Keychain  │
+│  (create,   │  encrypted    │  (decrypt,  │     │  (passcode, │
+│   read,     │◀───────────── │   encrypt)  │◀────│  passphrase)│
+│   inject)   │    body       └─────────────┘     └─────────────┘
+└─────────────┘                      │
+                                     ▼
+                              ┌─────────────┐
+                              │  Touch ID   │
+                              │  (decrypt)  │
+                              └─────────────┘
+```
+
+## License
+
+MIT
