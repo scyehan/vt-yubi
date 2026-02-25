@@ -61,7 +61,7 @@ pub fn delete_keychain(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn local_authentication(reason: &str) -> bool {
+pub fn local_authentication(_reason: &str) -> bool {
     #[cfg(not(target_os = "macos"))]
     {
         tracing::warn!("local authentication is not supported on this platform");
@@ -209,6 +209,7 @@ impl AesGcmCrypto {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use security_framework::passwords::delete_generic_password;
     use tracing_test::traced_test;
 

@@ -28,11 +28,12 @@ exec = "0.3.1"
 libc = "0.2.174"
 hostname = "0.4.1"
 dirs = "5"
+ssh-agent-lib = { version = "0.5", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.3.0"
 localauthentication-rs = "0.1.0"
-ssh-agent-lib = { version = "0.5", features = ["codec"] }
+ssh-agent-lib = { version = "0.5", default-features = false, features = ["agent", "codec"] }
 ssh-key = { version = "0.6", features = ["ed25519", "rsa", "p256", "p384", "encryption", "crypto"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rsa = "0.9"

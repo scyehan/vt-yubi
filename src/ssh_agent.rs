@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use ssh_agent_lib::agent::{listen, Session};
 use ssh_agent_lib::error::AgentError;
-use ssh_agent_lib::proto::{AddIdentity, Credential, Identity, RemoveIdentity, SignRequest};
+use ssh_agent_lib::proto::{
+    AddIdentity, Credential, Extension, Identity, RemoveIdentity, SignRequest, Unparsed,
+};
 use ssh_key::private::{KeypairData, PrivateKey};
 use ssh_key::public::KeyData;
 use ssh_key::{Algorithm, HashAlg, Signature};
@@ -17,6 +19,7 @@ use crate::security::{
     get_keychain, load_mac_cipher, load_passcode_ciphers, local_authentication, set_keychain,
     AesGcmCrypto,
 };
+use crate::serve::{do_decrypt, do_encrypt, CryptoResItem, DecryptReq, EncryptItem};
 
 fn agent_err(e: anyhow::Error) -> AgentError {
     AgentError::Other(Box::new(std::io::Error::new(
@@ -254,6 +257,68 @@ impl Session for VtSshAgent {
             }
             _ => Err(AgentError::Failure),
         }
+    }
+
+    async fn extension(
+        &mut self,
+        extension: Extension,
+    ) -> Result<Option<Extension>, AgentError> {
+        let locked = self.locked.read().await;
+        if *locked {
+            return Err(AgentError::Failure);
+        }
+        drop(locked);
+
+        self.touch_activity().await;
+
+        // Load auth cipher from keychain to verify VT_AUTH
+        let (auth_cipher, passphrase_cipher) = load_passcode_ciphers().map_err(agent_err)?;
+
+        // Decrypt the extension details with auth cipher (verifies VT_AUTH)
+        let decrypted = auth_cipher
+            .decrypt(extension.details.as_ref())
+            .map_err(|_| {
+                tracing::warn!("Extension auth failed (wrong VT_AUTH?)");
+                AgentError::Failure
+            })?;
+
+        let response_bytes = match extension.name.as_str() {
+            "encrypt@vt" => {
+                let items: Vec<EncryptItem> =
+                    serde_json::from_slice(&decrypted).map_err(|e| agent_err(e.into()))?;
+                let mac_cipher = load_mac_cipher(&passphrase_cipher).map_err(agent_err)?;
+                let result: Vec<CryptoResItem> = do_encrypt(&mac_cipher, items);
+                serde_json::to_vec(&result).map_err(|e| agent_err(e.into()))?
+            }
+            "decrypt@vt" => {
+                let req: DecryptReq =
+                    serde_json::from_slice(&decrypted).map_err(|e| agent_err(e.into()))?;
+                let local_auth_message = format!(
+                    "decrypt {} items from {} to run `{}`",
+                    req.items.len(),
+                    req.host,
+                    req.command,
+                );
+                if !local_authentication(&local_auth_message) {
+                    return Err(AgentError::Failure);
+                }
+                let mac_cipher = load_mac_cipher(&passphrase_cipher).map_err(agent_err)?;
+                let result: Vec<CryptoResItem> = do_decrypt(&mac_cipher, req.items);
+                serde_json::to_vec(&result).map_err(|e| agent_err(e.into()))?
+            }
+            _ => {
+                tracing::warn!("Unknown extension: {}", extension.name);
+                return Err(AgentError::Failure);
+            }
+        };
+
+        // Encrypt response with auth cipher
+        let encrypted_response = auth_cipher.encrypt(&response_bytes).map_err(agent_err)?;
+
+        Ok(Some(Extension {
+            name: extension.name,
+            details: Unparsed::from(encrypted_response),
+        }))
     }
 
     async fn add_identity(&mut self, identity: AddIdentity) -> Result<(), AgentError> {

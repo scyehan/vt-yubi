@@ -11,6 +11,7 @@ use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
+use ssh_agent_lib::proto::{Extension, Unparsed};
 use std::io::{self, Write};
 use tracing::debug;
 
@@ -27,12 +28,12 @@ pub fn init() -> Result<()> {
 }
 
 pub struct VTClient {
-    base_url: String,
+    base_url: Option<String>,
     auth_token: String,
 }
 
 impl VTClient {
-    pub fn new(base_url: String, auth_token: String) -> Self {
+    pub fn new(base_url: Option<String>, auth_token: String) -> Self {
         debug!("Using auth token: {}", auth_token);
         VTClient {
             base_url,
@@ -41,11 +42,14 @@ impl VTClient {
     }
 
     pub async fn authed_request<T: Serialize, R: DeserializeOwned>(
-        self,
+        &self,
         path: &str,
         req_body: &T,
     ) -> Result<R> {
-        let mut base_url = self.base_url;
+        let mut base_url = self
+            .base_url
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("VT_ADDR not set and SSH agent socket not available"))?;
         if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
             let protocol = if is_ip_address(&base_url) {
                 "http://"
@@ -82,6 +86,81 @@ impl VTClient {
             Err(anyhow::anyhow!("status: {:?} body: {}", status, res_str))
         }
     }
+
+    /// Try to send an extension request via the SSH agent socket.
+    /// Returns Ok(Some(bytes)) on success, Ok(None) if socket not available, Err on auth/agent errors.
+    #[cfg(unix)]
+    fn try_agent_extension(auth_token: &str, name: &str, payload: &[u8]) -> Result<Option<Vec<u8>>> {
+        use std::os::unix::net::UnixStream;
+
+        let socket_path = if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
+            std::path::PathBuf::from(sock)
+        } else {
+            let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?;
+            home.join(".ssh").join("vt.sock")
+        };
+
+        let stream = match UnixStream::connect(&socket_path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        let auth_key = decode_auth_cipher_from_b64(auth_token)?;
+        let auth_cipher = AesGcmCrypto::new(&auth_key)?;
+        let encrypted_payload = auth_cipher.encrypt(payload)?;
+
+        let ext = Extension {
+            name: name.to_string(),
+            details: Unparsed::from(encrypted_payload),
+        };
+
+        let mut client = ssh_agent_lib::blocking::Client::new(stream);
+        let response = client.extension(ext).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        match response {
+            Some(resp) => {
+                let decrypted = auth_cipher.decrypt(resp.details.as_ref())?;
+                Ok(Some(decrypted))
+            }
+            None => Err(anyhow::anyhow!("Agent returned empty extension response")),
+        }
+    }
+
+    pub async fn encrypt(&self, items: &[EncryptItem]) -> Result<Vec<CryptoResItem>> {
+        #[cfg(unix)]
+        {
+            let payload = serde_json::to_vec(items)?;
+            let auth_token = self.auth_token.clone();
+            let result =
+                tokio::task::spawn_blocking(move || Self::try_agent_extension(&auth_token, "encrypt@vt", &payload))
+                    .await??;
+            match result {
+                Some(bytes) => return Ok(serde_json::from_slice(&bytes)?),
+                None if self.base_url.is_some() => debug!("Agent socket not available, falling back to HTTP"),
+                None => return Err(anyhow::anyhow!("SSH agent socket not available and VT_ADDR not set")),
+            }
+        }
+        self.authed_request("/encrypt", &items).await
+    }
+
+    pub async fn decrypt(&self, req: &DecryptReq) -> Result<Vec<CryptoResItem>> {
+        #[cfg(unix)]
+        {
+            let payload = serde_json::to_vec(req)?;
+            let auth_token = self.auth_token.clone();
+            let result =
+                tokio::task::spawn_blocking(move || Self::try_agent_extension(&auth_token, "decrypt@vt", &payload))
+                    .await??;
+            match result {
+                Some(bytes) => return Ok(serde_json::from_slice(&bytes)?),
+                None if self.base_url.is_some() => debug!("Agent socket not available, falling back to HTTP"),
+                None => return Err(anyhow::anyhow!("SSH agent socket not available and VT_ADDR not set")),
+            }
+        }
+        self.authed_request("/decrypt", req).await
+    }
 }
 
 fn prompt_input_password(prompt_before: &str, prompt_after: &str) -> Result<String> {
@@ -117,13 +196,10 @@ pub async fn create(vt_client: VTClient) -> Result<()> {
     debug!("User input for secret: '{}'", secret);
 
     let res = vt_client
-        .authed_request::<Vec<EncryptItem>, Vec<CryptoResItem>>(
-            "/encrypt",
-            &vec![EncryptItem {
-                plaintext: secret.to_string(),
-                t: secret_type,
-            }],
-        )
+        .encrypt(&vec![EncryptItem {
+            plaintext: secret.to_string(),
+            t: secret_type,
+        }])
         .await?;
     if res[0].err_message != "" {
         return Err(anyhow::anyhow!(
@@ -153,9 +229,7 @@ pub async fn read(vt_client: VTClient, vt: String) -> Result<()> {
         command: "[read]".to_string(),
         items: vec![vt],
     };
-    let res = vt_client
-        .authed_request::<DecryptReq, Vec<CryptoResItem>>("/decrypt", &req)
-        .await?;
+    let res = vt_client.decrypt(&req).await?;
     ensure!(res.len() == 1, "Expected exactly one item in response");
     ensure!(
         res[0].err_message.is_empty(),
@@ -182,14 +256,11 @@ async fn decrypt_from_multi_str(
     }
 
     let res = vt_client
-        .authed_request::<DecryptReq, Vec<CryptoResItem>>(
-            "/decrypt",
-            &DecryptReq {
-                host: get_hostname(),
-                command: command,
-                items: encrypted_vec.clone(),
-            },
-        )
+        .decrypt(&DecryptReq {
+            host: get_hostname(),
+            command: command,
+            items: encrypted_vec.clone(),
+        })
         .await?;
     ensure!(
         res.len() == encrypted_vec.len(),
@@ -508,7 +579,7 @@ mod tests {
 
     fn create_vt_client() -> VTClient {
         VTClient::new(
-            "http://127.0.0.1:5757".to_owned(),
+            Some("http://127.0.0.1:5757".to_owned()),
             "MY5hkACZQZbqfpuYaWjnzlbpGVQYhwqynnrpkek568g".to_string(),
         )
     }

@@ -17,10 +17,9 @@ struct Cli {
         long,
         global = true,
         env = "VT_ADDR",
-        default_value = "127.0.0.1:5757",
         help = "Host and port in the format host:port, e.g. 127.0.0.1:5757"
     )]
-    addr: String,
+    addr: Option<String>,
 
     #[arg(
         long,
@@ -170,7 +169,7 @@ async fn main() {
     let command_result = match &cli.command {
         #[cfg(target_os = "macos")]
         Commands::Serve | Commands::Init => match &cli.command {
-            Commands::Serve => serve::serve(&cli.addr).await,
+            Commands::Serve => serve::serve(cli.addr.as_deref().unwrap_or("127.0.0.1:5757")).await,
             Commands::Init => cli::init(),
             _ => unreachable!(),
         },
@@ -193,11 +192,11 @@ async fn main() {
             SshCommands::Show { fingerprint } => ssh_cli::ssh_show(fingerprint),
         },
         Commands::Create => {
-            let vt_client = VTClient::new(cli.addr.clone(), cli.auth);
+            let vt_client = VTClient::new(cli.addr.clone(), cli.auth.clone());
             cli::create(vt_client).await
         }
         Commands::Read { vt } => {
-            let vt_client = VTClient::new(cli.addr.clone(), cli.auth);
+            let vt_client = VTClient::new(cli.addr.clone(), cli.auth.clone());
             cli::read(vt_client, vt.to_string()).await
         }
         Commands::Inject {
@@ -207,7 +206,7 @@ async fn main() {
             timeout,
             args,
         } => {
-            let vt_client = VTClient::new(cli.addr.clone(), cli.auth);
+            let vt_client = VTClient::new(cli.addr.clone(), cli.auth.clone());
             cli::inject(
                 vt_client,
                 replace_file.clone(),

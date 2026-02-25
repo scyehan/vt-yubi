@@ -154,6 +154,7 @@ pub async fn serve(addr: &str) -> Result<()> {
         load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
 
     // Start SSH agent in background
+    #[cfg(target_os = "macos")]
     tokio::spawn(async move {
         if let Err(e) = crate::ssh_agent::run_ssh_agent(
             false,
