@@ -153,6 +153,18 @@ pub async fn serve(addr: &str) -> Result<()> {
     let (auth_cipher, passphrase_cipher) =
         load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
 
+    // Start SSH agent in background
+    tokio::spawn(async move {
+        if let Err(e) = crate::ssh_agent::run_ssh_agent(
+            false,
+            crate::ssh_agent::DEFAULT_IDLE_TIMEOUT_SECS,
+        )
+        .await
+        {
+            tracing::warn!("SSH agent failed: {}", e);
+        }
+    });
+
     let addr = addr.parse::<SocketAddr>()?;
     tracing::info!("Starting server on {}", addr);
 

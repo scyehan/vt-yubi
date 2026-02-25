@@ -5,6 +5,10 @@ use crate::cli::VTClient;
 mod cli;
 mod security;
 mod serve;
+#[cfg(target_os = "macos")]
+mod ssh_agent;
+#[cfg(target_os = "macos")]
+mod ssh_cli;
 
 #[derive(Parser)]
 #[command(author, version, about="a simple kms. no plain, explicit auth everywhere")]
@@ -80,6 +84,10 @@ enum Commands {
     #[cfg(target_os = "macos")]
     #[command(subcommand)]
     Secret(SecretCommands),
+    /// (Mac only) SSH agent and key management
+    #[cfg(target_os = "macos")]
+    #[command(subcommand)]
+    Ssh(SshCommands),
 }
 
 #[cfg(target_os = "macos")]
@@ -93,6 +101,49 @@ pub enum SecretCommands {
     RotatePasscode {
         #[arg(long, help = "Absolute path to the new vt binary")]
         bin_absolute_path: Option<String>,
+    },
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Subcommand, PartialEq)]
+pub enum SshCommands {
+    /// Start the SSH agent (listens on ~/.ssh/vt.sock)
+    Agent {
+        #[arg(
+            short = 't',
+            long = "timeout",
+            default_value_t = ssh_agent::DEFAULT_IDLE_TIMEOUT_SECS,
+            help = "Idle timeout in seconds before clearing keys from memory (default: 1800 = 30min)"
+        )]
+        timeout: u64,
+    },
+    /// Add an SSH private key to the keychain
+    Add {
+        #[arg(short = 'f', long = "file", help = "Path to the SSH private key file")]
+        file: Option<String>,
+        #[arg(short = 'c', long = "comment", help = "Comment for the key (overrides key's embedded comment)")]
+        comment: Option<String>,
+    },
+    /// List stored SSH keys
+    List,
+    /// Remove an SSH key by fingerprint
+    Remove {
+        #[arg(help = "Fingerprint (or prefix) of the key to remove")]
+        fingerprint: String,
+    },
+    /// Remove all stored SSH keys
+    RemoveAll,
+    /// Change the comment of a stored SSH key
+    Comment {
+        #[arg(help = "Fingerprint (or prefix) of the key to update")]
+        fingerprint: String,
+        #[arg(short = 'c', long = "comment", help = "New comment for the key")]
+        comment: String,
+    },
+    /// Show the public key for a stored SSH key
+    Show {
+        #[arg(help = "Fingerprint (or prefix) of the key to show")]
+        fingerprint: String,
     },
 }
 
@@ -130,6 +181,16 @@ async fn main() {
             SecretCommands::RotatePasscode { bin_absolute_path } => {
                 cli::rotate_passcode(bin_absolute_path.clone()).await
             }
+        },
+        #[cfg(target_os = "macos")]
+        Commands::Ssh(ssh_command) => match ssh_command {
+            SshCommands::Agent { timeout } => ssh_agent::start_ssh_agent(*timeout).await,
+            SshCommands::Add { file, comment } => ssh_cli::ssh_add(file.clone(), comment.clone()),
+            SshCommands::List => ssh_cli::ssh_list(),
+            SshCommands::Remove { fingerprint } => ssh_cli::ssh_remove(fingerprint),
+            SshCommands::RemoveAll => ssh_cli::ssh_remove_all(),
+            SshCommands::Comment { fingerprint, comment } => ssh_cli::ssh_comment(fingerprint, comment),
+            SshCommands::Show { fingerprint } => ssh_cli::ssh_show(fingerprint),
         },
         Commands::Create => {
             let vt_client = VTClient::new(cli.addr.clone(), cli.auth);

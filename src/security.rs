@@ -42,6 +42,25 @@ pub fn get_keychain(name: &str) -> Result<Vec<u8>> {
     }
 }
 
+#[allow(dead_code)]
+pub fn delete_keychain(name: &str) -> Result<()> {
+    #[cfg(all(not(debug_assertions), target_os = "macos"))]
+    {
+        use security_framework::passwords::delete_generic_password;
+        let service = "rusty.vault.".to_string() + name;
+        delete_generic_password(&service, &"prod".to_string())
+            .map_err(|e| anyhow::anyhow!("Failed to delete keychain {}: {}", name, e))?;
+    }
+    #[cfg(any(debug_assertions, not(target_os = "macos")))]
+    {
+        tracing::warn!(
+            "deleting keychain {}, but not support for this build",
+            name
+        );
+    }
+    Ok(())
+}
+
 pub fn local_authentication(reason: &str) -> bool {
     #[cfg(not(target_os = "macos"))]
     {
