@@ -20,6 +20,9 @@ jobs:
             os: ubuntu-latest
             artifact: vt-linux-amd64
 
+    env:
+      VERSION: ${{ github.ref_name }}
+
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -39,14 +42,14 @@ jobs:
 
       - name: Package binary
         run: |
-          cp target/${{ matrix.target }}/release/vt ${{ matrix.artifact }}
-          chmod +x ${{ matrix.artifact }}
+          chmod +x target/${{ matrix.target }}/release/vt
+          tar czf ${{ matrix.artifact }}-${{ env.VERSION }}.tar.gz -C target/${{ matrix.target }}/release vt
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          name: ${{ matrix.artifact }}-${{ env.VERSION }}
+          path: ${{ matrix.artifact }}-${{ env.VERSION }}.tar.gz
 
   release:
     needs: build
