@@ -100,11 +100,9 @@ pub fn do_decrypt(cipher: &AesGcmCrypto, items: Vec<String>) -> Vec<CryptoResIte
                     SecretType::TOTP => match b64_to_decrypted(&item[1..]) {
                         Ok(decrypted_str) => match Secret::Encoded(decrypted_str).to_bytes() {
                             Ok(secret_bytes) => {
-                                match TOTP::new(Algorithm::SHA1, 6, 1, 30, secret_bytes) {
-                                    Ok(totp) => totp.generate_current()
-                                        .map_err(|e| anyhow::anyhow!("TOTP generate error: {}", e)),
-                                    Err(e) => Err(anyhow::anyhow!("TOTP invalid: {}", e)),
-                                }
+                                TOTP::new_unchecked(Algorithm::SHA1, 6, 1, 30, secret_bytes)
+                                    .generate_current()
+                                    .map_err(|e| anyhow::anyhow!("TOTP generate error: {}", e))
                             }
                             Err(e) => Err(anyhow::anyhow!("TOTP secret encode error: {}", e)),
                         },
