@@ -12,6 +12,7 @@ fn require_auth(auth: &Option<String>) -> Result<String> {
 mod cli;
 mod core;
 mod security;
+#[cfg(target_os = "macos")]
 mod serve;
 #[cfg(target_os = "macos")]
 mod ssh_agent;
