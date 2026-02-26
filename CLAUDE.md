@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build --release        # Release build (uses real macOS keychain)
-cargo build                  # Debug build (uses hardcoded test keychain values)
+cargo build                  # Debug build
 cargo test                   # Run non-ignored tests (pure crypto tests, no server needed)
 cargo test test_name         # Run a specific test
 cargo test -- --ignored      # Run ALL tests (requires running server + macOS keychain)
@@ -18,7 +18,7 @@ VT (Vault) is a macOS-based KMS using the system keychain for secret storage and
 
 ### Source Files (src/)
 
-- **main.rs** — CLI entry point (clap). Subcommands: `serve`, `init`, `create`, `read`, `inject`, `secret {export,import,rotate-passcode}`, `ssh {agent,add,list,remove,remove-all,show}`. Server-side commands (`serve`, `init`, `secret`, `ssh`) are `#[cfg(target_os = "macos")]`.
+- **main.rs** — CLI entry point (clap). Subcommands: `serve`, `init`, `create`, `read`, `inject`, `secret {export,import,rotate-passcode}`, `ssh {agent,add,list,remove,remove-all,comment,show}`. Server-side commands (`serve`, `init`, `secret`, `ssh`) are `#[cfg(target_os = "macos")]`.
 - **core.rs** — Shared domain types (`EncryptItem`, `DecryptReq`, `CryptoResItem`, `SecretType`) and crypto logic (`do_encrypt`, `do_decrypt`). Used by both `serve.rs` and `ssh_agent.rs`.
 - **serve.rs** — Axum HTTP server with `/encrypt` and `/decrypt` POST endpoints. Auth middleware encrypts/decrypts the entire request and response body using `VT_AUTH`-derived key, including error responses (all post-auth responses are encrypted; pre-auth errors return generic plaintext). Decrypt requires Touch ID/local auth. Also spawns the SSH agent as a background tokio task on startup.
 - **cli.rs** — Client logic. `VTClient` sends body-encrypted requests; error responses are decrypted if possible (post-auth), falling back to raw bytes (pre-auth). `inject` uses `libc::fork()` for timed file cleanup and `exec::Command` to replace the process.

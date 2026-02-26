@@ -58,7 +58,7 @@ cp target/release/vt /usr/local/bin/
 | `secret rotate-passcode` | (macOS) Rotate the passcode for the master secret |
 | `ssh agent` | (macOS) Start the SSH agent (supports `--timeout`, `--ssh-auth-cache-mode`, `--ssh-auth-cache-duration`) |
 | `ssh add [-f <file>] [-c <comment>]` | (macOS) Add an SSH private key (from file or stdin) |
-| `ssh list` | (macOS) List stored SSH keys |
+| `ssh list` | (macOS) List stored SSH keys (shows fingerprint, algorithm, comment, and public key) |
 | `ssh comment <fingerprint> -c <comment>` | (macOS) Change the comment of a stored key |
 | `ssh remove <fingerprint>` | (macOS) Remove an SSH key by fingerprint |
 | `ssh remove-all` | (macOS) Remove all stored SSH keys |
