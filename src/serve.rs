@@ -54,26 +54,15 @@ async fn auth_middleware_impl(
                 Request::from_parts(parts, Body::from(decrypted_bytes))
             }
             Err(_) => {
-                return (
-                    StatusCode::FORBIDDEN,
-                    "Decryption req failed, Wrong VT_AUTH ?",
-                )
-                    .into_response()
+                return (StatusCode::FORBIDDEN, "Request failed").into_response()
             }
         },
         Err(_) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to read request body",
-            )
-                .into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Request failed").into_response()
         }
     };
 
     let response = next.run(decrypted_req).await;
-    if !response.status().is_success() {
-        return response;
-    }
 
     let (parts, body) = response.into_parts();
     match to_bytes(body, MAX_BODY_SIZE).await {
@@ -95,13 +84,13 @@ async fn auth_middleware_impl(
             match auth_cipher.encrypt(&raw_bytes) {
                 Ok(encrypted_bytes) => Response::from_parts(parts, Body::from(encrypted_bytes)),
                 Err(_) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, "encryption failed").into_response()
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "Request failed").into_response()
                 }
             }
         }
         Err(_) => {
             warn!("Failed to read response body in auth middleware");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "auth middleware").into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Request failed").into_response();
         }
     }
 }

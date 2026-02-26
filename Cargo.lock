@@ -2628,11 +2628,13 @@ dependencies = [
  "sha2",
  "ssh-agent-lib",
  "ssh-key",
+ "subtle",
  "tokio",
  "totp-rs",
  "tracing",
  "tracing-subscriber",
  "tracing-test",
+ "zeroize",
 ]
 
 [[package]]

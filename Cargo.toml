@@ -41,6 +41,8 @@ sha1 = { version = "0.10", features = ["oid"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
 p384 = { version = "0.13", features = ["ecdsa"] }
 async-trait = "0.1"
+subtle = "2"
+zeroize = "1"
 
 [dev-dependencies]
 tracing-test = "0.2.5"

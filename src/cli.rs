@@ -78,7 +78,11 @@ impl VTClient {
                 serde_json::from_slice(&decrypted_body).context("Failed to parse response body")?;
             Ok(res_body)
         } else {
-            let res_str = String::from_utf8_lossy(&res_bytes);
+            // Post-auth errors are encrypted; pre-auth errors are plaintext
+            let res_str = match cipher.decrypt(&res_bytes) {
+                Ok(decrypted) => String::from_utf8_lossy(&decrypted).into_owned(),
+                Err(_) => String::from_utf8_lossy(&res_bytes).into_owned(),
+            };
             Err(anyhow::anyhow!("status: {:?} body: {}", status, res_str))
         }
     }

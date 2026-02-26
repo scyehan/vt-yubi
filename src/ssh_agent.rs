@@ -251,6 +251,15 @@ mod proc_info {
 
 // --- SSH Agent ---
 
+/// Hash a lock passphrase to a 32-byte SHA-256 digest.
+fn hash_lock_passphrase(passphrase: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(passphrase.as_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&hash);
+    out
+}
+
 /// Default idle timeout: 30 minutes.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
 /// Default auth cache duration: 5 minutes.
@@ -317,7 +326,8 @@ pub struct VtSshAgentFactory {
     keys: Arc<RwLock<HashMap<String, PrivateKey>>>,
     last_activity: Arc<RwLock<Instant>>,
     locked: Arc<RwLock<bool>>,
-    lock_passphrase: Arc<RwLock<Option<String>>>,
+    lock_passphrase: Arc<RwLock<Option<[u8; 32]>>>,
+    idle_cleared: Arc<RwLock<bool>>,
     auth_cache: Arc<RwLock<AuthCache>>,
     cache_mode: AuthCacheMode,
 }
@@ -333,6 +343,7 @@ impl VtSshAgentFactory {
             last_activity: Arc::new(RwLock::new(Instant::now())),
             locked: Arc::new(RwLock::new(false)),
             lock_passphrase: Arc::new(RwLock::new(None)),
+            idle_cleared: Arc::new(RwLock::new(false)),
             auth_cache: Arc::new(RwLock::new(AuthCache::new(cache_duration_secs))),
             cache_mode,
         }
@@ -350,6 +361,7 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
             last_activity: Arc::clone(&self.last_activity),
             locked: Arc::clone(&self.locked),
             lock_passphrase: Arc::clone(&self.lock_passphrase),
+            idle_cleared: Arc::clone(&self.idle_cleared),
             auth_cache: Arc::clone(&self.auth_cache),
             peer_pid,
             cache_mode: self.cache_mode,
@@ -363,7 +375,8 @@ struct VtSshSession {
     keys: Arc<RwLock<HashMap<String, PrivateKey>>>,
     last_activity: Arc<RwLock<Instant>>,
     locked: Arc<RwLock<bool>>,
-    lock_passphrase: Arc<RwLock<Option<String>>>,
+    lock_passphrase: Arc<RwLock<Option<[u8; 32]>>>,
+    idle_cleared: Arc<RwLock<bool>>,
     auth_cache: Arc<RwLock<AuthCache>>,
     peer_pid: Option<i32>,
     cache_mode: AuthCacheMode,
@@ -371,7 +384,7 @@ struct VtSshSession {
 
 impl VtSshSession {
     /// Ensure keys are loaded. If they were cleared by the idle sweeper,
-    /// silently reload from keychain (Touch ID is checked per sign request).
+    /// require Touch ID before reloading from keychain.
     async fn ensure_keys_loaded(&self) -> Result<(), AgentError> {
         let keys = self.keys.read().await;
         if !keys.is_empty() {
@@ -379,11 +392,27 @@ impl VtSshSession {
         }
         drop(keys);
 
+        // Check if keys were cleared by idle timeout (vs just being empty)
+        let idle = *self.idle_cleared.read().await;
+        if !idle {
+            return Ok(());
+        }
+
+        // Require Touch ID before reloading keys after idle timeout
+        if !local_authentication("reload SSH keys after idle timeout") {
+            return Err(AgentError::Failure);
+        }
+
         tracing::info!("Keys cleared by idle timeout, reloading from keychain");
         let loaded = load_all_keys().map_err(agent_err)?;
         tracing::info!("Reloaded {} SSH keys", loaded.len());
         let mut keys = self.keys.write().await;
         *keys = loaded;
+
+        // Reset idle_cleared flag
+        let mut idle_cleared = self.idle_cleared.write().await;
+        *idle_cleared = false;
+
         Ok(())
     }
 
@@ -450,7 +479,12 @@ impl Session for VtSshSession {
         }
         drop(locked);
 
-        self.ensure_keys_loaded().await?;
+        // After idle timeout, return empty list (like locked state).
+        // Touch ID is only required on sign/extension requests.
+        let idle_cleared = *self.idle_cleared.read().await;
+        if idle_cleared {
+            return Ok(Vec::new());
+        }
 
         let keys = self.keys.read().await;
         let identities = keys
@@ -723,7 +757,11 @@ impl Session for VtSshSession {
         }
         *locked = true;
         let mut lp = self.lock_passphrase.write().await;
-        *lp = Some(passphrase);
+        *lp = Some(hash_lock_passphrase(&passphrase));
+
+        // Clear keys from memory on lock
+        let mut keys = self.keys.write().await;
+        keys.clear();
 
         // Clear auth cache on lock
         let mut cache = self.auth_cache.write().await;
@@ -734,18 +772,41 @@ impl Session for VtSshSession {
     }
 
     async fn unlock(&mut self, passphrase: String) -> Result<(), AgentError> {
+        use subtle::ConstantTimeEq;
+        use zeroize::Zeroize;
+
         let mut locked = self.locked.write().await;
         if !*locked {
             return Err(AgentError::Failure);
         }
+        let candidate = hash_lock_passphrase(&passphrase);
         let lp = self.lock_passphrase.read().await;
-        if lp.as_deref() != Some(&passphrase) {
+        let matches = match lp.as_ref() {
+            Some(stored) => stored.ct_eq(&candidate).into(),
+            None => false,
+        };
+        drop(lp);
+        if !matches {
             return Err(AgentError::Failure);
         }
-        drop(lp);
         *locked = false;
         let mut lp = self.lock_passphrase.write().await;
+        if let Some(ref mut hash) = *lp {
+            hash.zeroize();
+        }
         *lp = None;
+
+        // Reload keys after unlock
+        match load_all_keys() {
+            Ok(loaded) => {
+                let mut keys = self.keys.write().await;
+                *keys = loaded;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to reload keys after unlock: {}", e);
+            }
+        }
+
         tracing::info!("Agent unlocked");
         Ok(())
     }
@@ -795,6 +856,7 @@ pub async fn run_ssh_agent(
     // Spawn idle sweeper that clears keys from memory after inactivity
     let sweeper_keys = Arc::clone(&factory.keys);
     let sweeper_last = Arc::clone(&factory.last_activity);
+    let sweeper_idle_cleared = Arc::clone(&factory.idle_cleared);
     let sweeper_timeout = idle_timeout;
     tokio::spawn(async move {
         let check_interval = Duration::from_secs(60).min(sweeper_timeout);
@@ -806,6 +868,8 @@ pub async fn run_ssh_agent(
                 if !keys.is_empty() {
                     let count = keys.len();
                     keys.clear();
+                    let mut idle_cleared = sweeper_idle_cleared.write().await;
+                    *idle_cleared = true;
                     tracing::info!(
                         "Idle timeout ({} min), cleared {} keys from memory",
                         sweeper_timeout.as_secs() / 60,
