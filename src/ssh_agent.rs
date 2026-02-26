@@ -483,11 +483,15 @@ impl Session for VtSshSession {
             .and_then(proc_info::get_proc_path)
             .and_then(|p| p.rsplit('/').next().map(String::from))
             .unwrap_or_default();
-        let auth_message = match (comment.is_empty(), proc_name.is_empty()) {
-            (true, true) => format!("SSH sign with {}", fp_str),
-            (true, false) => format!("SSH sign with {} ({})", fp_str, proc_name),
-            (false, true) => format!("SSH sign: {} ({})", comment, fp_str),
-            (false, false) => format!("SSH sign: {} ({}) by {}", comment, fp_str, proc_name),
+        let key_label = if comment.is_empty() {
+            fp_str.clone()
+        } else {
+            comment.to_string()
+        };
+        let auth_message = if proc_name.is_empty() {
+            format!("SSH sign: {}", key_label)
+        } else {
+            format!("SSH sign: {} by {}", key_label, proc_name)
         };
 
         // Check auth cache or prompt Touch ID
