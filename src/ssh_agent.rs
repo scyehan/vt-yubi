@@ -1,11 +1,12 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use ssh_agent_lib::agent::{listen, Session};
+use ssh_agent_lib::agent::{listen, Agent, Session};
 use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto::{
     AddIdentity, Credential, Extension, Identity, RemoveIdentity, SignRequest, Unparsed,
@@ -56,18 +57,204 @@ pub fn save_ssh_keys(cipher: &AesGcmCrypto, entries: &[SshKeyEntry]) -> Result<(
     set_keychain("ssh_keys", &encrypted)
 }
 
+// --- Auth Cache ---
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthCacheMode {
+    None,
+    PerSession,
+    PerApp,
+}
+
+impl FromStr for AuthCacheMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "none" => Ok(AuthCacheMode::None),
+            "per-session" | "per_session" | "session" => Ok(AuthCacheMode::PerSession),
+            "per-app" | "per_app" | "app" => Ok(AuthCacheMode::PerApp),
+            _ => Err(format!(
+                "invalid auth cache mode '{}': expected none, per-session, or per-app",
+                s
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for AuthCacheMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthCacheMode::None => write!(f, "none"),
+            AuthCacheMode::PerSession => write!(f, "per-session"),
+            AuthCacheMode::PerApp => write!(f, "per-app"),
+        }
+    }
+}
+
+pub struct AuthCache {
+    entries: HashMap<(u64, String), Instant>,
+    duration: Duration,
+}
+
+impl AuthCache {
+    pub fn new(duration_secs: u64) -> Self {
+        Self {
+            entries: HashMap::new(),
+            duration: Duration::from_secs(duration_secs),
+        }
+    }
+
+    pub fn is_authorized(&self, context_id: u64, fingerprint: &str) -> bool {
+        if let Some(grant_time) = self.entries.get(&(context_id, fingerprint.to_string())) {
+            grant_time.elapsed() < self.duration
+        } else {
+            false
+        }
+    }
+
+    pub fn grant(&mut self, context_id: u64, fingerprint: &str) {
+        self.entries
+            .insert((context_id, fingerprint.to_string()), Instant::now());
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    pub fn sweep_expired(&mut self) {
+        self.entries
+            .retain(|_, grant_time| grant_time.elapsed() < self.duration);
+    }
+}
+
+// --- macOS process introspection ---
+
+mod proc_info {
+    const PROC_PIDTBSDINFO: libc::c_int = 3;
+    const MAXPATHLEN: u32 = 1024;
+    const MAXCOMLEN: usize = 16;
+
+    #[repr(C)]
+    struct ProcBsdInfo {
+        pbi_flags: u32,
+        pbi_status: u32,
+        pbi_xstatus: u32,
+        pbi_pid: u32,
+        pbi_ppid: u32,
+        pbi_uid: u32,
+        pbi_gid: u32,
+        pbi_ruid: u32,
+        pbi_rgid: u32,
+        pbi_svuid: u32,
+        pbi_svgid: u32,
+        rfu_1: u32,
+        pbi_comm: [u8; MAXCOMLEN],
+        pbi_name: [u8; 2 * MAXCOMLEN],
+        pbi_nfiles: u32,
+        pbi_pgid: u32,
+        pbi_pjobc: u32,
+        e_tdev: u32,
+        e_tpgid: u32,
+        pbi_nice: i32,
+        pbi_start_tvsec: u64,
+        pbi_start_tvusec: u64,
+    }
+
+    extern "C" {
+        fn proc_pidinfo(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            buffersize: libc::c_int,
+        ) -> libc::c_int;
+        fn proc_pidpath(
+            pid: libc::c_int,
+            buffer: *mut libc::c_void,
+            buffersize: u32,
+        ) -> libc::c_int;
+    }
+
+    /// Get process BSD info: returns (ppid, tdev) or None.
+    pub fn get_proc_bsdinfo(pid: i32) -> Option<(u32, u32)> {
+        let mut info: ProcBsdInfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<ProcBsdInfo>() as libc::c_int;
+        let ret = unsafe {
+            proc_pidinfo(
+                pid,
+                PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        if ret == size {
+            Some((info.pbi_ppid, info.e_tdev))
+        } else {
+            None
+        }
+    }
+
+    /// Get process executable path.
+    pub fn get_proc_path(pid: i32) -> Option<String> {
+        let mut buf = vec![0u8; MAXPATHLEN as usize];
+        let ret = unsafe {
+            proc_pidpath(
+                pid,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                MAXPATHLEN,
+            )
+        };
+        if ret > 0 {
+            buf.truncate(ret as usize);
+            String::from_utf8(buf).ok()
+        } else {
+            None
+        }
+    }
+
+    /// Get the controlling TTY device number for a process.
+    pub fn get_tty_dev(pid: i32) -> u64 {
+        get_proc_bsdinfo(pid)
+            .map(|(_, tdev)| tdev as u64)
+            .unwrap_or(0)
+    }
+
+    /// Walk the process tree upward to find a `.app/Contents/` ancestor.
+    /// Returns the PID of the app process, or the direct parent as fallback.
+    pub fn find_app_pid(peer_pid: i32) -> u64 {
+        let mut current_pid = peer_pid;
+        // Limit traversal to prevent infinite loops
+        for _ in 0..64 {
+            if current_pid <= 1 {
+                break;
+            }
+            if let Some(path) = get_proc_path(current_pid) {
+                if path.contains(".app/Contents/") {
+                    return current_pid as u64;
+                }
+            }
+            match get_proc_bsdinfo(current_pid) {
+                Some((ppid, _)) if ppid > 0 && ppid as i32 != current_pid => {
+                    current_pid = ppid as i32;
+                }
+                _ => break,
+            }
+        }
+        // Fallback: return the immediate parent of the peer
+        get_proc_bsdinfo(peer_pid)
+            .map(|(ppid, _)| ppid as u64)
+            .unwrap_or(peer_pid as u64)
+    }
+}
+
 // --- SSH Agent ---
 
 /// Default idle timeout: 30 minutes.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
-
-#[derive(Clone)]
-pub struct VtSshAgent {
-    keys: Arc<RwLock<HashMap<String, PrivateKey>>>,
-    last_activity: Arc<RwLock<Instant>>,
-    locked: Arc<RwLock<bool>>,
-    lock_passphrase: Arc<RwLock<Option<String>>>,
-}
+/// Default auth cache duration: 5 minutes.
+pub const DEFAULT_AUTH_CACHE_DURATION_SECS: u64 = 300;
 
 /// Load mac_cipher on demand from keychain (avoids keeping the master key in memory).
 fn load_cipher_from_keychain() -> Result<AesGcmCrypto> {
@@ -95,21 +282,94 @@ fn load_all_keys() -> Result<HashMap<String, PrivateKey>> {
     Ok(keys)
 }
 
-impl VtSshAgent {
-    fn new(keys: HashMap<String, PrivateKey>) -> Self {
+fn fingerprint_str(key_data: &KeyData) -> String {
+    let fp = ssh_key::Fingerprint::new(HashAlg::Sha256, key_data);
+    fp.to_string()
+}
+
+/// Get the peer PID from a Unix stream using macOS LOCAL_PEERPID.
+fn get_peer_pid(stream: &tokio::net::UnixStream) -> Option<i32> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut pid: libc::pid_t = 0;
+    let mut pid_size = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    const SOL_LOCAL: libc::c_int = 0;
+    const LOCAL_PEERPID: libc::c_int = 0x002;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            SOL_LOCAL,
+            LOCAL_PEERPID,
+            &mut pid as *mut _ as *mut libc::c_void,
+            &mut pid_size,
+        )
+    };
+    if ret == 0 && pid > 0 {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
+// --- Factory (shared state, implements Agent) ---
+
+pub struct VtSshAgentFactory {
+    keys: Arc<RwLock<HashMap<String, PrivateKey>>>,
+    last_activity: Arc<RwLock<Instant>>,
+    locked: Arc<RwLock<bool>>,
+    lock_passphrase: Arc<RwLock<Option<String>>>,
+    auth_cache: Arc<RwLock<AuthCache>>,
+    cache_mode: AuthCacheMode,
+}
+
+impl VtSshAgentFactory {
+    fn new(
+        keys: HashMap<String, PrivateKey>,
+        cache_mode: AuthCacheMode,
+        cache_duration_secs: u64,
+    ) -> Self {
         Self {
             keys: Arc::new(RwLock::new(keys)),
             last_activity: Arc::new(RwLock::new(Instant::now())),
             locked: Arc::new(RwLock::new(false)),
             lock_passphrase: Arc::new(RwLock::new(None)),
+            auth_cache: Arc::new(RwLock::new(AuthCache::new(cache_duration_secs))),
+            cache_mode,
         }
     }
+}
 
-    fn fingerprint_str(key_data: &KeyData) -> String {
-        let fp = ssh_key::Fingerprint::new(HashAlg::Sha256, key_data);
-        fp.to_string()
+impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
+    fn new_session(&mut self, socket: &tokio::net::UnixStream) -> impl Session {
+        let peer_pid = get_peer_pid(socket);
+        if let Some(pid) = peer_pid {
+            tracing::debug!("New session from PID {}", pid);
+        }
+        VtSshSession {
+            keys: Arc::clone(&self.keys),
+            last_activity: Arc::clone(&self.last_activity),
+            locked: Arc::clone(&self.locked),
+            lock_passphrase: Arc::clone(&self.lock_passphrase),
+            auth_cache: Arc::clone(&self.auth_cache),
+            peer_pid,
+            cache_mode: self.cache_mode,
+        }
     }
+}
 
+// --- Per-connection session (implements Session) ---
+
+struct VtSshSession {
+    keys: Arc<RwLock<HashMap<String, PrivateKey>>>,
+    last_activity: Arc<RwLock<Instant>>,
+    locked: Arc<RwLock<bool>>,
+    lock_passphrase: Arc<RwLock<Option<String>>>,
+    auth_cache: Arc<RwLock<AuthCache>>,
+    peer_pid: Option<i32>,
+    cache_mode: AuthCacheMode,
+}
+
+impl VtSshSession {
     /// Ensure keys are loaded. If they were cleared by the idle sweeper,
     /// silently reload from keychain (Touch ID is checked per sign request).
     async fn ensure_keys_loaded(&self) -> Result<(), AgentError> {
@@ -131,10 +391,58 @@ impl VtSshAgent {
         let mut last = self.last_activity.write().await;
         *last = Instant::now();
     }
+
+    /// Check auth cache or prompt Touch ID. Returns true if authorized.
+    async fn check_or_prompt_auth(&self, fingerprint: &str, auth_message: &str) -> bool {
+        let context_id = match self.cache_mode {
+            AuthCacheMode::None => {
+                return local_authentication(auth_message);
+            }
+            AuthCacheMode::PerSession => match self.peer_pid {
+                Some(pid) => proc_info::get_tty_dev(pid),
+                None => return local_authentication(auth_message),
+            },
+            AuthCacheMode::PerApp => match self.peer_pid {
+                Some(pid) => proc_info::find_app_pid(pid),
+                None => return local_authentication(auth_message),
+            },
+        };
+
+        // Check cache (read lock, released before Touch ID)
+        {
+            let cache = self.auth_cache.read().await;
+            if cache.is_authorized(context_id, fingerprint) {
+                tracing::debug!(
+                    "Auth cache hit for context={} fingerprint={}",
+                    context_id,
+                    fingerprint
+                );
+                return true;
+            }
+        }
+
+        // Prompt Touch ID (no locks held)
+        if !local_authentication(auth_message) {
+            return false;
+        }
+
+        // Grant cache entry (write lock)
+        {
+            let mut cache = self.auth_cache.write().await;
+            cache.grant(context_id, fingerprint);
+            tracing::debug!(
+                "Auth cache grant for context={} fingerprint={}",
+                context_id,
+                fingerprint
+            );
+        }
+
+        true
+    }
 }
 
 #[async_trait]
-impl Session for VtSshAgent {
+impl Session for VtSshSession {
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
         let locked = self.locked.read().await;
         if *locked {
@@ -165,19 +473,25 @@ impl Session for VtSshAgent {
         self.ensure_keys_loaded().await?;
         self.touch_activity().await;
 
-        let fp_str = Self::fingerprint_str(&request.pubkey);
+        let fp_str = fingerprint_str(&request.pubkey);
 
         let keys = self.keys.read().await;
         let privkey = keys.get(&fp_str).ok_or(AgentError::Failure)?;
         let comment = privkey.comment();
-        let auth_message = if comment.is_empty() {
-            format!("SSH sign with {}", fp_str)
-        } else {
-            format!("SSH sign: {} ({})", comment, fp_str)
+        let proc_name = self
+            .peer_pid
+            .and_then(proc_info::get_proc_path)
+            .and_then(|p| p.rsplit('/').next().map(String::from))
+            .unwrap_or_default();
+        let auth_message = match (comment.is_empty(), proc_name.is_empty()) {
+            (true, true) => format!("SSH sign with {}", fp_str),
+            (true, false) => format!("SSH sign with {} ({})", fp_str, proc_name),
+            (false, true) => format!("SSH sign: {} ({})", comment, fp_str),
+            (false, false) => format!("SSH sign: {} ({}) by {}", comment, fp_str, proc_name),
         };
 
-        // Require Touch ID for every sign request
-        if !local_authentication(&auth_message) {
+        // Check auth cache or prompt Touch ID
+        if !self.check_or_prompt_auth(&fp_str, &auth_message).await {
             return Err(AgentError::Failure);
         }
 
@@ -269,6 +583,12 @@ impl Session for VtSshAgent {
         }
         drop(locked);
 
+        // Only handle vt custom protocol extensions; ignore standard SSH extensions
+        if extension.name != "encrypt@vt" && extension.name != "decrypt@vt" {
+            // Return None to indicate unsupported extension (not an error)
+            return Ok(None);
+        }
+
         self.touch_activity().await;
 
         // Load auth cipher from keychain to verify VT_AUTH
@@ -299,17 +619,18 @@ impl Session for VtSshAgent {
                     req.host,
                     req.command,
                 );
-                if !local_authentication(&local_auth_message) {
+                // Check auth cache or prompt Touch ID
+                if !self
+                    .check_or_prompt_auth("decrypt@vt", &local_auth_message)
+                    .await
+                {
                     return Err(AgentError::Failure);
                 }
                 let mac_cipher = load_mac_cipher(&passphrase_cipher).map_err(agent_err)?;
                 let result: Vec<CryptoResItem> = do_decrypt(&mac_cipher, req.items);
                 serde_json::to_vec(&result).map_err(|e| agent_err(e.into()))?
             }
-            _ => {
-                tracing::warn!("Unknown extension: {}", extension.name);
-                return Err(AgentError::Failure);
-            }
+            _ => unreachable!(),
         };
 
         // Encrypt response with auth cipher
@@ -333,7 +654,7 @@ impl Session for VtSshAgent {
                 let private_key =
                     PrivateKey::new(privkey, comment.clone()).map_err(AgentError::other)?;
                 let pubkey = private_key.public_key();
-                let fp_str = Self::fingerprint_str(pubkey.key_data());
+                let fp_str = fingerprint_str(pubkey.key_data());
 
                 let key_openssh = private_key
                     .to_openssh(ssh_key::LineEnding::LF)
@@ -364,7 +685,7 @@ impl Session for VtSshAgent {
     }
 
     async fn remove_identity(&mut self, identity: RemoveIdentity) -> Result<(), AgentError> {
-        let fp_str = Self::fingerprint_str(&identity.pubkey);
+        let fp_str = fingerprint_str(&identity.pubkey);
 
         if let Ok(cipher) = load_cipher_from_keychain() {
             let mut entries = load_ssh_keys(&cipher).unwrap_or_default();
@@ -399,6 +720,11 @@ impl Session for VtSshAgent {
         *locked = true;
         let mut lp = self.lock_passphrase.write().await;
         *lp = Some(passphrase);
+
+        // Clear auth cache on lock
+        let mut cache = self.auth_cache.write().await;
+        cache.clear();
+
         tracing::info!("Agent locked");
         Ok(())
     }
@@ -426,7 +752,12 @@ impl Session for VtSshAgent {
 /// Run the SSH agent on `~/.ssh/vt.sock`.
 /// Loads the cipher from keychain to decrypt stored keys, then drops it.
 /// When `print_env` is true, prints `export SSH_AUTH_SOCK=...` for eval.
-pub async fn run_ssh_agent(print_env: bool, idle_timeout_secs: u64) -> Result<()> {
+pub async fn run_ssh_agent(
+    print_env: bool,
+    idle_timeout_secs: u64,
+    cache_mode: AuthCacheMode,
+    cache_duration_secs: u64,
+) -> Result<()> {
     let idle_timeout = Duration::from_secs(idle_timeout_secs);
 
     // Load keys (cipher is loaded and dropped inside load_all_keys)
@@ -455,11 +786,11 @@ pub async fn run_ssh_agent(print_env: bool, idle_timeout_secs: u64) -> Result<()
         println!("echo Agent pid {};", std::process::id());
     }
 
-    let agent = VtSshAgent::new(keys);
+    let factory = VtSshAgentFactory::new(keys, cache_mode, cache_duration_secs);
 
     // Spawn idle sweeper that clears keys from memory after inactivity
-    let sweeper_keys = Arc::clone(&agent.keys);
-    let sweeper_last = Arc::clone(&agent.last_activity);
+    let sweeper_keys = Arc::clone(&factory.keys);
+    let sweeper_last = Arc::clone(&factory.last_activity);
     let sweeper_timeout = idle_timeout;
     tokio::spawn(async move {
         let check_interval = Duration::from_secs(60).min(sweeper_timeout);
@@ -480,6 +811,24 @@ pub async fn run_ssh_agent(print_env: bool, idle_timeout_secs: u64) -> Result<()
             }
         }
     });
+
+    // Spawn auth cache sweeper (reuse same pattern)
+    if cache_mode != AuthCacheMode::None {
+        let sweeper_cache = Arc::clone(&factory.auth_cache);
+        tokio::spawn(async move {
+            let check_interval = Duration::from_secs(60);
+            loop {
+                tokio::time::sleep(check_interval).await;
+                let mut cache = sweeper_cache.write().await;
+                cache.sweep_expired();
+            }
+        });
+        tracing::info!(
+            "Auth cache: mode={}, duration={}s",
+            cache_mode,
+            cache_duration_secs
+        );
+    }
 
     let listener = tokio::net::UnixListener::bind(&socket_path)?;
     tracing::info!(
@@ -504,7 +853,7 @@ pub async fn run_ssh_agent(print_env: bool, idle_timeout_secs: u64) -> Result<()
         std::process::exit(0);
     });
 
-    listen(listener, agent)
+    listen(listener, factory)
         .await
         .map_err(|e| anyhow::anyhow!("Agent error: {}", e))?;
 
@@ -514,8 +863,12 @@ pub async fn run_ssh_agent(print_env: bool, idle_timeout_secs: u64) -> Result<()
 }
 
 /// Standalone entry point: runs the agent with env output.
-pub async fn start_ssh_agent(idle_timeout_secs: u64) -> Result<()> {
-    run_ssh_agent(true, idle_timeout_secs).await
+pub async fn start_ssh_agent(
+    idle_timeout_secs: u64,
+    cache_mode: AuthCacheMode,
+    cache_duration_secs: u64,
+) -> Result<()> {
+    run_ssh_agent(true, idle_timeout_secs, cache_mode, cache_duration_secs).await
 }
 
 #[cfg(test)]
@@ -575,5 +928,138 @@ mod tests {
         let entries = load_ssh_keys(&cipher);
         assert!(entries.is_ok());
         assert!(entries.unwrap().is_empty());
+    }
+
+    // --- AuthCacheMode tests ---
+
+    #[test]
+    fn test_auth_cache_mode_from_str() {
+        assert_eq!(AuthCacheMode::from_str("none").unwrap(), AuthCacheMode::None);
+        assert_eq!(
+            AuthCacheMode::from_str("per-session").unwrap(),
+            AuthCacheMode::PerSession
+        );
+        assert_eq!(
+            AuthCacheMode::from_str("per_session").unwrap(),
+            AuthCacheMode::PerSession
+        );
+        assert_eq!(
+            AuthCacheMode::from_str("session").unwrap(),
+            AuthCacheMode::PerSession
+        );
+        assert_eq!(
+            AuthCacheMode::from_str("per-app").unwrap(),
+            AuthCacheMode::PerApp
+        );
+        assert_eq!(
+            AuthCacheMode::from_str("per_app").unwrap(),
+            AuthCacheMode::PerApp
+        );
+        assert_eq!(AuthCacheMode::from_str("app").unwrap(), AuthCacheMode::PerApp);
+    }
+
+    #[test]
+    fn test_auth_cache_mode_from_str_case_insensitive() {
+        assert_eq!(AuthCacheMode::from_str("None").unwrap(), AuthCacheMode::None);
+        assert_eq!(AuthCacheMode::from_str("NONE").unwrap(), AuthCacheMode::None);
+        assert_eq!(
+            AuthCacheMode::from_str("Per-Session").unwrap(),
+            AuthCacheMode::PerSession
+        );
+        assert_eq!(
+            AuthCacheMode::from_str("PER-APP").unwrap(),
+            AuthCacheMode::PerApp
+        );
+    }
+
+    #[test]
+    fn test_auth_cache_mode_from_str_invalid() {
+        assert!(AuthCacheMode::from_str("invalid").is_err());
+        assert!(AuthCacheMode::from_str("").is_err());
+        assert!(AuthCacheMode::from_str("per").is_err());
+    }
+
+    #[test]
+    fn test_auth_cache_mode_display() {
+        assert_eq!(AuthCacheMode::None.to_string(), "none");
+        assert_eq!(AuthCacheMode::PerSession.to_string(), "per-session");
+        assert_eq!(AuthCacheMode::PerApp.to_string(), "per-app");
+    }
+
+    // --- AuthCache tests ---
+
+    #[test]
+    fn test_auth_cache_grant_and_hit() {
+        let mut cache = AuthCache::new(300);
+        assert!(!cache.is_authorized(1, "fp1"));
+
+        cache.grant(1, "fp1");
+        assert!(cache.is_authorized(1, "fp1"));
+    }
+
+    #[test]
+    fn test_auth_cache_different_context_misses() {
+        let mut cache = AuthCache::new(300);
+        cache.grant(1, "fp1");
+
+        // Same fingerprint, different context
+        assert!(!cache.is_authorized(2, "fp1"));
+        // Same context, different fingerprint
+        assert!(!cache.is_authorized(1, "fp2"));
+    }
+
+    #[test]
+    fn test_auth_cache_expiry() {
+        let mut cache = AuthCache::new(0); // 0 second duration = immediately expired
+        cache.grant(1, "fp1");
+
+        // With 0 duration, entries expire immediately
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(!cache.is_authorized(1, "fp1"));
+    }
+
+    #[test]
+    fn test_auth_cache_clear() {
+        let mut cache = AuthCache::new(300);
+        cache.grant(1, "fp1");
+        cache.grant(2, "fp2");
+        assert!(cache.is_authorized(1, "fp1"));
+
+        cache.clear();
+        assert!(!cache.is_authorized(1, "fp1"));
+        assert!(!cache.is_authorized(2, "fp2"));
+    }
+
+    #[test]
+    fn test_auth_cache_sweep_expired() {
+        let mut cache = AuthCache::new(0); // 0 second = immediately expired
+        cache.grant(1, "fp1");
+        cache.grant(2, "fp2");
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        cache.sweep_expired();
+        assert!(cache.entries.is_empty());
+    }
+
+    // --- proc_info tests (macOS only, require running process) ---
+
+    #[test]
+    #[ignore]
+    fn test_proc_bsdinfo_self() {
+        let pid = std::process::id() as i32;
+        let result = proc_info::get_proc_bsdinfo(pid);
+        assert!(result.is_some(), "Should be able to query own process");
+        let (ppid, _tdev) = result.unwrap();
+        assert!(ppid > 0, "Parent PID should be positive");
+    }
+
+    #[test]
+    #[ignore]
+    fn test_proc_path_self() {
+        let pid = std::process::id() as i32;
+        let result = proc_info::get_proc_path(pid);
+        assert!(result.is_some(), "Should be able to get own process path");
+        let path = result.unwrap();
+        assert!(!path.is_empty(), "Path should not be empty");
     }
 }

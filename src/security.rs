@@ -61,7 +61,7 @@ pub fn delete_keychain(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn local_authentication(_reason: &str) -> bool {
+pub fn local_authentication(reason: &str) -> bool {
     #[cfg(not(target_os = "macos"))]
     {
         tracing::warn!("local authentication is not supported on this platform");

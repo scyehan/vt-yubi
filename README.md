@@ -9,7 +9,7 @@ A simple KMS solution based on macOS keychain. No plaintext secrets, explicit au
 - Touch ID / local authentication for decrypt operations
 - TOTP support for time-based one-time passwords
 - Environment variable and file injection with automatic cleanup
-- SSH agent with Touch ID gated signing (Ed25519, RSA, ECDSA P-256/P-384)
+- SSH agent with Touch ID gated signing (Ed25519, RSA, ECDSA P-256/P-384) and optional per-session/per-app auth caching
 
 ## Installation
 
@@ -49,14 +49,14 @@ cp target/release/vt /usr/local/bin/
 | Command | Description |
 |---------|-------------|
 | `init` | (macOS) Initialize passcode and passphrase in keychain |
-| `serve` | (macOS) Start the KMS HTTP server and SSH agent |
+| `serve` | (macOS) Start the KMS HTTP server and SSH agent (supports `--ssh-idle-timeout`, `--ssh-auth-cache-mode`, `--ssh-auth-cache-duration`) |
 | `create` | Read plaintext from stdin, output encrypted vt protocol |
 | `read <vt>` | Decrypt a vt protocol string |
 | `inject` | Decrypt vt protocols in env/files, optionally run a command |
 | `secret export` | (macOS) Export the encrypted master secret |
 | `secret import` | (macOS) Import an encrypted master secret |
 | `secret rotate-passcode` | (macOS) Rotate the passcode for the master secret |
-| `ssh agent` | (macOS) Start the SSH agent (listens on `~/.ssh/vt.sock`) |
+| `ssh agent` | (macOS) Start the SSH agent (supports `--timeout`, `--ssh-auth-cache-mode`, `--ssh-auth-cache-duration`) |
 | `ssh add [-f <file>] [-c <comment>]` | (macOS) Add an SSH private key (from file or stdin) |
 | `ssh list` | (macOS) List stored SSH keys |
 | `ssh comment <fingerprint> -c <comment>` | (macOS) Change the comment of a stored key |
@@ -107,10 +107,17 @@ vt ssh show SHA256:...
 # To start it standalone:
 eval $(vt ssh agent)
 
+# Start with auth caching (skip repeated Touch ID within a time window):
+# per-session: cache by terminal session (TTY)
+eval $(vt ssh agent --ssh-auth-cache-mode per-session --ssh-auth-cache-duration 300)
+# per-app: cache by application (e.g., Terminal.app, iTerm2)
+eval $(vt ssh agent --ssh-auth-cache-mode per-app --ssh-auth-cache-duration 300)
+
 # Set SSH_AUTH_SOCK to use the agent (add to your shell profile)
 export SSH_AUTH_SOCK=~/.ssh/vt.sock
 
-# Now ssh/git commands use vt for authentication (Touch ID per sign)
+# Now ssh/git commands use vt for authentication
+# Touch ID prompt shows the calling process name (e.g., "SSH sign: key (SHA256:...) by ssh")
 ssh git@github.com
 git push origin main
 
@@ -121,7 +128,19 @@ vt ssh comment SHA256:... -c "new comment"
 vt ssh remove SHA256:...
 ```
 
-Keys are stored as individual keychain entries (`rusty.vault.ssh.<fingerprint>`) encrypted with the same `mac_cipher` used for other secrets. An index entry (`rusty.vault.ssh_index`) tracks all stored keys.
+Keys are stored as a single encrypted JSON blob in the keychain (`rusty.vault.ssh_keys`) using the same `mac_cipher` as other secrets.
+
+#### Auth Caching
+
+By default, Touch ID is required for every sign/decrypt request. You can enable auth caching to skip repeated prompts within a time window:
+
+| Mode | `--ssh-auth-cache-mode` | Scope |
+|------|-------------------------|-------|
+| None (default) | `none` | Touch ID every time |
+| Per-session | `per-session` | Shared within same terminal/TTY |
+| Per-app | `per-app` | Shared within same application (e.g., Terminal.app) |
+
+`--ssh-auth-cache-duration <SECONDS>` controls how long a grant lasts (default: 300s). The cache is cleared when the agent is locked.
 
 ## VT Protocol Format
 

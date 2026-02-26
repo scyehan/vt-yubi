@@ -22,7 +22,7 @@ VT (Vault) is a macOS-based KMS using the system keychain for secret storage and
 - **serve.rs** — Axum HTTP server with `/encrypt` and `/decrypt` POST endpoints. Auth middleware encrypts/decrypts the entire request and response body using `VT_AUTH`-derived key. Decrypt requires Touch ID/local auth. Also spawns the SSH agent as a background tokio task on startup.
 - **cli.rs** — Client logic. `VTClient` sends body-encrypted requests. `inject` uses `libc::fork()` for timed file cleanup and `exec::Command` to replace the process.
 - **security.rs** — `AesGcmCrypto` wrapper (AES-256-GCM with 12-byte nonce prepended to ciphertext). Keychain access via `security-framework` crate (`set_keychain`, `get_keychain`, `delete_keychain`), local auth via `localauthentication-rs`.
-- **ssh_agent.rs** — SSH agent implementation using `ssh-agent-lib`. `VtSshAgent` implements the `Session` trait (request_identities, sign, add/remove identity, lock/unlock). Keys stored in keychain as `rusty.vault.ssh.<fingerprint>` with an index at `rusty.vault.ssh_index`. Touch ID required for every sign request. Supports Ed25519, RSA, ECDSA P-256/P-384.
+- **ssh_agent.rs** — SSH agent implementation using `ssh-agent-lib`. Split into `VtSshAgentFactory` (implements `Agent<UnixListener>`, owns shared state) and `VtSshSession` (per-connection, implements `Session`). Includes `AuthCacheMode`/`AuthCache` for optional per-session or per-app Touch ID caching, and a `proc_info` module for macOS process introspection (`proc_pidinfo`/`proc_pidpath`). Keys stored in keychain as `rusty.vault.ssh_keys` (single encrypted JSON blob). Touch ID required for `sign()` and `decrypt@vt` (with optional caching). Non-vt extensions (e.g. `session-bind@openssh.com`) are passed through gracefully. Touch ID prompt includes the calling process name. Supports Ed25519, RSA, ECDSA P-256/P-384.
 - **ssh_cli.rs** — CLI functions for SSH key management: `ssh_add` (parse key from file or stdin with interactive comment prompt, encrypt, store), `ssh_list` (read index), `ssh_remove`/`ssh_remove_all` (delete from keychain + index), `ssh_show` (display public key).
 
 ### Debug vs Release Keychain
@@ -32,11 +32,13 @@ VT (Vault) is a macOS-based KMS using the system keychain for secret storage and
 ### SSH Agent Architecture
 
 SSH keys are stored encrypted in the macOS keychain using the same `mac_cipher` as other secrets:
-- **Index**: `rusty.vault.ssh_index` — JSON array of `{fingerprint, algorithm, comment}`, encrypted
-- **Keys**: `rusty.vault.ssh.<fingerprint>` — OpenSSH-format private key, encrypted
+- **Keys**: `rusty.vault.ssh_keys` — single encrypted JSON blob containing all key entries (fingerprint, algorithm, comment, OpenSSH private key)
 - **Agent socket**: `~/.ssh/vt.sock` — Unix domain socket, cleaned up on SIGINT/SIGTERM
 - **Eager loading**: All keys loaded into `Arc<RwLock<HashMap>>` at agent startup
-- **Touch ID**: Required for every `sign()` request; listing keys does not require auth
+- **Touch ID**: Required for `sign()` and `decrypt@vt` requests; listing keys does not require auth
+- **Auth caching**: Optional per-session (by TTY device) or per-app (by `.app` ancestor PID) caching of Touch ID authorization. Configured via `--ssh-auth-cache-mode` (`none`/`per-session`/`per-app`) and `--ssh-auth-cache-duration` (seconds). Cache is cleared on agent lock. A background sweeper removes expired entries.
+- **Factory/Session split**: `VtSshAgentFactory` implements `Agent<UnixListener>` to extract peer PID via `LOCAL_PEERPID` socket option. Each connection gets a `VtSshSession` with the peer PID for process-aware auth caching.
+- **Process introspection**: `proc_info` module uses `proc_pidinfo(PROC_PIDTBSDINFO)` for parent PID / TTY device and `proc_pidpath()` for executable path. Used for auth cache context resolution and displaying the calling process name in Touch ID prompts.
 
 ### Key Derivation Chain
 

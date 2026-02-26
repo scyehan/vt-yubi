@@ -149,7 +149,12 @@ struct AppState {
     passphrase_cipher: Arc<AesGcmCrypto>,
 }
 
-pub async fn serve(addr: &str) -> Result<()> {
+pub async fn serve(
+    addr: &str,
+    ssh_idle_timeout: u64,
+    auth_cache_mode: crate::ssh_agent::AuthCacheMode,
+    auth_cache_duration: u64,
+) -> Result<()> {
     let (auth_cipher, passphrase_cipher) =
         load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
 
@@ -158,7 +163,9 @@ pub async fn serve(addr: &str) -> Result<()> {
     tokio::spawn(async move {
         if let Err(e) = crate::ssh_agent::run_ssh_agent(
             false,
-            crate::ssh_agent::DEFAULT_IDLE_TIMEOUT_SECS,
+            ssh_idle_timeout,
+            auth_cache_mode,
+            auth_cache_duration,
         )
         .await
         {

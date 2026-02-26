@@ -75,7 +75,26 @@ enum Commands {
 
     #[cfg(target_os = "macos")]
     /// (Mac only) Run vt server
-    Serve,
+    Serve {
+        #[arg(
+            long = "ssh-idle-timeout",
+            default_value_t = ssh_agent::DEFAULT_IDLE_TIMEOUT_SECS,
+            help = "SSH agent idle timeout in seconds before clearing keys from memory (default: 1800 = 30min)"
+        )]
+        ssh_idle_timeout: u64,
+        #[arg(
+            long = "ssh-auth-cache-mode",
+            default_value = "none",
+            help = "Auth cache mode: none, per-session, or per-app"
+        )]
+        auth_cache_mode: ssh_agent::AuthCacheMode,
+        #[arg(
+            long = "ssh-auth-cache-duration",
+            default_value_t = ssh_agent::DEFAULT_AUTH_CACHE_DURATION_SECS,
+            help = "Auth cache duration in seconds (default: 300 = 5min)"
+        )]
+        auth_cache_duration: u64,
+    },
     /// (Mac only) Initialize passcode, passphrase which will be used by server
     #[cfg(target_os = "macos")]
     Init,
@@ -115,6 +134,18 @@ pub enum SshCommands {
             help = "Idle timeout in seconds before clearing keys from memory (default: 1800 = 30min)"
         )]
         timeout: u64,
+        #[arg(
+            long = "ssh-auth-cache-mode",
+            default_value = "none",
+            help = "Auth cache mode: none, per-session, or per-app"
+        )]
+        auth_cache_mode: ssh_agent::AuthCacheMode,
+        #[arg(
+            long = "ssh-auth-cache-duration",
+            default_value_t = ssh_agent::DEFAULT_AUTH_CACHE_DURATION_SECS,
+            help = "Auth cache duration in seconds (default: 300 = 5min)"
+        )]
+        auth_cache_duration: u64,
     },
     /// Add an SSH private key to the keychain
     Add {
@@ -168,8 +199,20 @@ async fn main() {
 
     let command_result = match &cli.command {
         #[cfg(target_os = "macos")]
-        Commands::Serve | Commands::Init => match &cli.command {
-            Commands::Serve => serve::serve(cli.addr.as_deref().unwrap_or("127.0.0.1:5757")).await,
+        Commands::Serve { .. } | Commands::Init => match &cli.command {
+            Commands::Serve {
+                ssh_idle_timeout,
+                auth_cache_mode,
+                auth_cache_duration,
+            } => {
+                serve::serve(
+                    cli.addr.as_deref().unwrap_or("127.0.0.1:5757"),
+                    *ssh_idle_timeout,
+                    *auth_cache_mode,
+                    *auth_cache_duration,
+                )
+                .await
+            }
             Commands::Init => cli::init(),
             _ => unreachable!(),
         },
@@ -183,7 +226,11 @@ async fn main() {
         },
         #[cfg(target_os = "macos")]
         Commands::Ssh(ssh_command) => match ssh_command {
-            SshCommands::Agent { timeout } => ssh_agent::start_ssh_agent(*timeout).await,
+            SshCommands::Agent {
+                timeout,
+                auth_cache_mode,
+                auth_cache_duration,
+            } => ssh_agent::start_ssh_agent(*timeout, *auth_cache_mode, *auth_cache_duration).await,
             SshCommands::Add { file, comment } => ssh_cli::ssh_add(file.clone(), comment.clone()),
             SshCommands::List => ssh_cli::ssh_list(),
             SshCommands::Remove { fingerprint } => ssh_cli::ssh_remove(fingerprint),
