@@ -475,12 +475,10 @@ impl Session for VtSshSession {
         }
         drop(locked);
 
-        // After idle timeout, return empty list (like locked state).
-        // Touch ID is only required on sign/extension requests.
-        let idle_cleared = *self.idle_cleared.read().await;
-        if idle_cleared {
-            return Ok(Vec::new());
-        }
+        // Reload keys from keychain if cleared by idle timeout.
+        // Listing public keys is not security-sensitive; Touch ID is
+        // enforced on sign/extension requests.
+        self.ensure_keys_loaded().await?;
 
         let keys = self.keys.read().await;
         let identities = keys
