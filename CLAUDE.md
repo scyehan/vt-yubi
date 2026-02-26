@@ -19,6 +19,7 @@ VT (Vault) is a macOS-based KMS using the system keychain for secret storage and
 ### Source Files (src/)
 
 - **main.rs** — CLI entry point (clap). Subcommands: `serve`, `init`, `create`, `read`, `inject`, `secret {export,import,rotate-passcode}`, `ssh {agent,add,list,remove,remove-all,show}`. Server-side commands (`serve`, `init`, `secret`, `ssh`) are `#[cfg(target_os = "macos")]`.
+- **core.rs** — Shared domain types (`EncryptItem`, `DecryptReq`, `CryptoResItem`, `SecretType`) and crypto logic (`do_encrypt`, `do_decrypt`). Used by both `serve.rs` and `ssh_agent.rs`.
 - **serve.rs** — Axum HTTP server with `/encrypt` and `/decrypt` POST endpoints. Auth middleware encrypts/decrypts the entire request and response body using `VT_AUTH`-derived key. Decrypt requires Touch ID/local auth. Also spawns the SSH agent as a background tokio task on startup.
 - **cli.rs** — Client logic. `VTClient` sends body-encrypted requests. `inject` uses `libc::fork()` for timed file cleanup and `exec::Command` to replace the process.
 - **security.rs** — `AesGcmCrypto` wrapper (AES-256-GCM with 12-byte nonce prepended to ciphertext). Keychain access via `security-framework` crate (`set_keychain`, `get_keychain`, `delete_keychain`), local auth via `localauthentication-rs`.

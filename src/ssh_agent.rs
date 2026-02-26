@@ -20,7 +20,7 @@ use crate::security::{
     get_keychain, load_mac_cipher, load_passcode_ciphers, local_authentication, set_keychain,
     AesGcmCrypto,
 };
-use crate::serve::{do_decrypt, do_encrypt, CryptoResItem, DecryptReq, EncryptItem};
+use crate::core::{do_decrypt, do_encrypt, CryptoResItem, DecryptReq, EncryptItem};
 
 fn agent_err(e: anyhow::Error) -> AgentError {
     AgentError::Other(Box::new(std::io::Error::new(

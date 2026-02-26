@@ -5,7 +5,7 @@ use crate::security::{
     create_and_save_passcode_passphrase, decode_auth_cipher_from_b64, get_keychain,
     load_passcode_ciphers, local_authentication, AesGcmCrypto,
 };
-use crate::serve::{CryptoResItem, DecryptReq, EncryptItem, SecretType};
+use crate::core::{CryptoResItem, DecryptReq, EncryptItem, SecretType};
 use anyhow::{ensure, Context, Result};
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -34,7 +34,6 @@ pub struct VTClient {
 
 impl VTClient {
     pub fn new(base_url: Option<String>, auth_token: String) -> Self {
-        debug!("Using auth token: {}", auth_token);
         VTClient {
             base_url,
             auth_token,
@@ -63,12 +62,10 @@ impl VTClient {
         let req_body = serde_json::to_vec(req_body)?;
         let cipher = AesGcmCrypto::new(&decode_auth_cipher_from_b64(&self.auth_token)?)?;
         let encrypted_body = cipher.encrypt(&req_body)?;
-        debug!("Encrypted request body: {:?}", req_body);
-
         let client = reqwest::Client::new();
         let res = client
             .post(&url)
-            .header("Content-Type", "application/json")
+            .header("Content-Type", "application/octet-stream")
             .body(encrypted_body)
             .send()
             .await
@@ -352,7 +349,6 @@ pub async fn inject(
 
     let env_vars: HashMap<String, String> = env::vars().collect();
     let env_json_str = serde_json::to_string(&env_vars)?;
-    debug!("Environment variables JSON: {}", env_json_str);
     args.push(env_json_str);
 
     let mut decrypted_args = decrypt_from_multi_str(vt_client, args, original_command).await?;

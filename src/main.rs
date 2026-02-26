@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use crate::cli::VTClient;
 
 mod cli;
+mod core;
 mod security;
 mod serve;
 #[cfg(target_os = "macos")]

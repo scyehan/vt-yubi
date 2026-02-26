@@ -81,7 +81,6 @@ pub fn derive_passphrase_secret(passcode: &[u8; 32], bin_path: Option<&str>) -> 
         .map(|s| s.to_string())
         .unwrap_or_else(|| env::current_exe().unwrap().to_string_lossy().to_string());
     let derived_str = format!("{}:{}:{}", passcode, env::var("USER")?, bin_path,);
-    tracing::debug!("derived_str: {}", derived_str);
     let hash = Sha256::digest(&Sha256::digest(derived_str.as_bytes()));
     let mut key = [0u8; 32];
     key.copy_from_slice(&hash[..32]);
@@ -216,7 +215,7 @@ mod tests {
     #[test]
     fn test_base64_encode() {
         let text = b"to be encoded".to_vec();
-        assert_eq!(BASE64_URL_SAFE_NO_PAD.encode(&text), "dG8gYmUgZW5jb2RlZA==");
+        assert_eq!(BASE64_URL_SAFE_NO_PAD.encode(&text), "dG8gYmUgZW5jb2RlZA");
     }
 
     #[traced_test]
