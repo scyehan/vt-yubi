@@ -36,7 +36,7 @@ SSH keys are stored encrypted in the macOS keychain using the same `mac_cipher` 
 - **Keys**: `rusty.vault.ssh_keys` — single encrypted JSON blob containing all key entries (fingerprint, algorithm, comment, OpenSSH private key)
 - **Agent socket**: `~/.ssh/vt.sock` — Unix domain socket, cleaned up on SIGINT/SIGTERM
 - **Eager loading**: All keys loaded into `Arc<RwLock<HashMap>>` at agent startup
-- **Touch ID**: Required for `sign()` and `decrypt@vt` requests; listing keys does not require auth. After idle timeout, Touch ID is required to reload keys (on the next `sign`/extension request); `request_identities` returns empty until then.
+- **Touch ID**: Required for `sign()` and `decrypt@vt` requests; listing keys does not require auth. After idle timeout, keys are silently reloaded on demand but `request_identities` returns empty until then; the normal auth cache rules enforce Touch ID on the subsequent `sign`/extension request.
 - **Auth caching**: Optional per-session (by TTY device) or per-app (by `.app` ancestor PID) caching of Touch ID authorization. Configured via `--ssh-auth-cache-mode` (`none`/`per-session`/`per-app`) and `--ssh-auth-cache-duration` (seconds). Cache is cleared on agent lock. A background sweeper removes expired entries.
 - **Factory/Session split**: `VtSshAgentFactory` implements `Agent<UnixListener>` to extract peer PID via `LOCAL_PEERPID` socket option. Each connection gets a `VtSshSession` with the peer PID for process-aware auth caching.
 - **Process introspection**: `proc_info` module uses `proc_pidinfo(PROC_PIDTBSDINFO)` for parent PID / TTY device and `proc_pidpath()` for executable path. Used for auth cache context resolution and displaying the calling process name in Touch ID prompts.

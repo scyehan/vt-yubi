@@ -384,7 +384,8 @@ struct VtSshSession {
 
 impl VtSshSession {
     /// Ensure keys are loaded. If they were cleared by the idle sweeper,
-    /// require Touch ID before reloading from keychain.
+    /// silently reload from keychain. Touch ID is enforced per sign/extension
+    /// request via `check_or_prompt_auth()` using the normal cache rules.
     async fn ensure_keys_loaded(&self) -> Result<(), AgentError> {
         let keys = self.keys.read().await;
         if !keys.is_empty() {
@@ -396,11 +397,6 @@ impl VtSshSession {
         let idle = *self.idle_cleared.read().await;
         if !idle {
             return Ok(());
-        }
-
-        // Require Touch ID before reloading keys after idle timeout
-        if !local_authentication("reload SSH keys after idle timeout") {
-            return Err(AgentError::Failure);
         }
 
         tracing::info!("Keys cleared by idle timeout, reloading from keychain");
