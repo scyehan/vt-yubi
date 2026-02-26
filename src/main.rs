@@ -89,6 +89,12 @@ enum Commands {
     /// (Mac only) Run vt server
     Serve {
         #[arg(
+            long = "enable-http",
+            default_value_t = false,
+            help = "Enable the HTTP server for encrypt/decrypt endpoints"
+        )]
+        enable_http: bool,
+        #[arg(
             long = "ssh-idle-timeout",
             default_value_t = ssh_agent::DEFAULT_IDLE_TIMEOUT_SECS,
             help = "SSH agent idle timeout in seconds before clearing keys from memory"
@@ -198,12 +204,14 @@ async fn run(cli: Cli) -> Result<()> {
         #[cfg(target_os = "macos")]
         Commands::Serve { .. } | Commands::Init => match &cli.command {
             Commands::Serve {
+                enable_http,
                 ssh_idle_timeout,
                 auth_cache_mode,
                 auth_cache_duration,
             } => {
                 serve::serve(
                     cli.addr.as_deref().unwrap_or("127.0.0.1:5757"),
+                    *enable_http,
                     *ssh_idle_timeout,
                     *auth_cache_mode,
                     *auth_cache_duration,

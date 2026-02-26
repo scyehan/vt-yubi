@@ -141,6 +141,7 @@ struct AppState {
 
 pub async fn serve(
     addr: &str,
+    enable_http: bool,
     ssh_idle_timeout: u64,
     auth_cache_mode: crate::ssh_agent::AuthCacheMode,
     auth_cache_duration: u64,
@@ -148,9 +149,8 @@ pub async fn serve(
     let (auth_cipher, passphrase_cipher) =
         load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
 
-    // Start SSH agent in background
-    #[cfg(target_os = "macos")]
-    tokio::spawn(async move {
+    // Start SSH agent
+    let ssh_handle = tokio::spawn(async move {
         if let Err(e) = crate::ssh_agent::run_ssh_agent(
             false,
             ssh_idle_timeout,
@@ -163,23 +163,29 @@ pub async fn serve(
         }
     });
 
-    let addr = addr.parse::<SocketAddr>()?;
-    tracing::info!("Starting server on {}", addr);
+    if enable_http {
+        let addr = addr.parse::<SocketAddr>()?;
+        tracing::info!("Starting HTTP server on {}", addr);
 
-    let app = Router::new()
-        .route("/decrypt", post(handler_decrypt))
-        .route("/encrypt", post(handler_encrypt))
-        .with_state(AppState {
-            passphrase_cipher: Arc::new(passphrase_cipher),
-        })
-        .layer(middleware::from_fn(create_auth_middleware(Arc::new(
-            auth_cipher,
-        ))))
-        .layer(middleware::from_fn(log_middleware))
-        .layer(DefaultBodyLimit::max(MAX_BODY_SIZE));
+        let app = Router::new()
+            .route("/decrypt", post(handler_decrypt))
+            .route("/encrypt", post(handler_encrypt))
+            .with_state(AppState {
+                passphrase_cipher: Arc::new(passphrase_cipher),
+            })
+            .layer(middleware::from_fn(create_auth_middleware(Arc::new(
+                auth_cipher,
+            ))))
+            .layer(middleware::from_fn(log_middleware))
+            .layer(DefaultBodyLimit::max(MAX_BODY_SIZE));
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        axum::serve(listener, app).await?;
+    } else {
+        tracing::info!("HTTP server disabled, running SSH agent only");
+        ssh_handle.await?;
+    }
+
     Ok(())
 }
 
