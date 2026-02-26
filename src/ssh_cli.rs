@@ -102,9 +102,13 @@ pub fn ssh_list() -> Result<()> {
     }
 
     for entry in &entries {
+        let pubkey_line = PrivateKey::from_openssh(entry.key_data.as_bytes())
+            .ok()
+            .and_then(|pk| pk.public_key().to_openssh().ok())
+            .unwrap_or_default();
         println!(
-            "{} {} {}",
-            entry.algorithm, entry.fingerprint, entry.comment
+            "{} {} {}\n  {}",
+            entry.algorithm, entry.fingerprint, entry.comment, pubkey_line
         );
     }
     Ok(())
