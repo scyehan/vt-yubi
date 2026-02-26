@@ -13,6 +13,10 @@ A simple KMS solution based on macOS keychain. No plaintext secrets, explicit au
 
 ## Installation
 
+Download prebuilt binaries from [GitHub Releases](https://github.com/timqi/vt/releases) (macOS arm64, Linux amd64).
+
+Or build from source:
+
 ```bash
 cargo build --release
 cp target/release/vt /usr/local/bin/
@@ -48,6 +52,7 @@ cp target/release/vt /usr/local/bin/
 
 | Command | Description |
 |---------|-------------|
+| `version` | Show version information |
 | `init` | (macOS) Initialize passcode and passphrase in keychain |
 | `serve` | (macOS) Start the KMS HTTP server and SSH agent (supports `--ssh-idle-timeout`, `--ssh-auth-cache-mode`, `--ssh-auth-cache-duration`) |
 | `create` | Read plaintext from stdin, output encrypted vt protocol |
