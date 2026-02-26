@@ -574,10 +574,8 @@ mod tests {
     use tracing_test::traced_test;
 
     fn create_vt_client() -> VTClient {
-        VTClient::new(
-            Some("http://127.0.0.1:5757".to_owned()),
-            "MY5hkACZQZbqfpuYaWjnzlbpGVQYhwqynnrpkek568g".to_string(),
-        )
+        let auth = std::env::var("VT_AUTH").expect("VT_AUTH must be set for integration tests");
+        VTClient::new(Some("http://127.0.0.1:5757".to_owned()), auth)
     }
 
     #[traced_test]

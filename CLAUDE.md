@@ -26,9 +26,9 @@ VT (Vault) is a macOS-based KMS using the system keychain for secret storage and
 - **ssh_agent.rs** — SSH agent implementation using `ssh-agent-lib`. Split into `VtSshAgentFactory` (implements `Agent<UnixListener>`, owns shared state) and `VtSshSession` (per-connection, implements `Session`). Includes `AuthCacheMode`/`AuthCache` for optional per-session or per-app Touch ID caching, and a `proc_info` module for macOS process introspection (`proc_pidinfo`/`proc_pidpath`). Keys stored in keychain as `rusty.vault.ssh_keys` (single encrypted JSON blob). Touch ID required for `sign()` and `decrypt@vt` (with optional caching). Non-vt extensions (e.g. `session-bind@openssh.com`) are passed through gracefully. Touch ID prompt includes the calling process name. Supports Ed25519, RSA, ECDSA P-256/P-384.
 - **ssh_cli.rs** — CLI functions for SSH key management: `ssh_add` (parse key from file or stdin with interactive comment prompt, encrypt, store), `ssh_list` (read index), `ssh_remove`/`ssh_remove_all` (delete from keychain + index), `ssh_show` (display public key).
 
-### Debug vs Release Keychain
+### Keychain Access
 
-**Critical for development**: In debug builds, `get_keychain()` returns hardcoded test values instead of reading from macOS keychain. `set_keychain()` and `delete_keychain()` are no-ops. This means debug builds can run crypto tests without keychain setup, but `serve`/`init`/`ssh` only work properly in release builds.
+All builds (debug and release) use the real macOS keychain. There are no hardcoded test stubs. This means `vt init` must be run before `serve`/`ssh` commands work in any build. Pure crypto unit tests do not require keychain access.
 
 ### SSH Agent Architecture
 

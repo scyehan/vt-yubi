@@ -9,55 +9,51 @@ use sha2::{Digest, Sha256};
 use std::env;
 
 pub fn set_keychain(name: &str, _value: &[u8]) -> Result<()> {
-    #[cfg(all(not(debug_assertions), target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     {
         use security_framework::passwords::set_generic_password;
         let service = "rusty.vault.".to_string() + name;
         set_generic_password(&service, &"prod".to_string(), &_value)?;
-        // debug!("set keychain {}: {}", name, BASE64_URL_SAFE_NO_PAD.encode(value));
     }
-    #[cfg(any(debug_assertions, not(target_os = "macos")))]
+    #[cfg(not(target_os = "macos"))]
     {
-        tracing::warn!("setting keychain {}, but not support for this build", name);
+        let _ = name;
+        anyhow::bail!("keychain is only supported on macOS");
     }
+    #[cfg(target_os = "macos")]
     Ok(())
 }
 
 pub fn get_keychain(name: &str) -> Result<Vec<u8>> {
-    #[cfg(all(not(debug_assertions), target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     {
         use security_framework::passwords::get_generic_password;
         let service = "rusty.vault.".to_string() + name;
         get_generic_password(&service, &"prod".to_string())
             .map_err(|e| anyhow::anyhow!("Failed to get keychain {}: {}", name, e))
     }
-    #[cfg(any(debug_assertions, not(target_os = "macos")))]
+    #[cfg(not(target_os = "macos"))]
     {
-        tracing::warn!("getting keychain {}, but not support for this build", name);
-        match name {
-            "passcode" => Ok(BASE64_URL_SAFE_NO_PAD.decode("w2AzjSZPSGk6Nw0ktvhiQS-EW7H_r2UIkwg5J1ThobnXv0Q4-NTSuHKC9H0-pZRhhjWV2LYzJ05BNeymxywaRw")?),
-            "passphrase" => Ok(BASE64_URL_SAFE_NO_PAD.decode("XihANpKGERcXzYQvCHVB1VAh50nIt8pyEFjqC_N5Bpkta55AI1HqUGKipR2MVjaYNJN3j4SWw4KCNCTe")?),
-            _ => Err(anyhow::anyhow!("Unsupported keychain name: {}", name)),
-        }
+        let _ = name;
+        anyhow::bail!("keychain is only supported on macOS");
     }
 }
 
 #[allow(dead_code)]
 pub fn delete_keychain(name: &str) -> Result<()> {
-    #[cfg(all(not(debug_assertions), target_os = "macos"))]
+    #[cfg(target_os = "macos")]
     {
         use security_framework::passwords::delete_generic_password;
         let service = "rusty.vault.".to_string() + name;
         delete_generic_password(&service, &"prod".to_string())
             .map_err(|e| anyhow::anyhow!("Failed to delete keychain {}: {}", name, e))?;
     }
-    #[cfg(any(debug_assertions, not(target_os = "macos")))]
+    #[cfg(not(target_os = "macos"))]
     {
-        tracing::warn!(
-            "deleting keychain {}, but not support for this build",
-            name
-        );
+        let _ = name;
+        anyhow::bail!("keychain is only supported on macOS");
     }
+    #[cfg(target_os = "macos")]
     Ok(())
 }
 
@@ -208,8 +204,6 @@ impl AesGcmCrypto {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "macos")]
-    use security_framework::passwords::delete_generic_password;
     use tracing_test::traced_test;
 
     #[test]
