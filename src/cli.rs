@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::{env, vec};
 
 use crate::security::{
@@ -347,16 +346,22 @@ pub async fn inject(
     };
     args.push(input_file_content);
 
-    let env_vars: HashMap<String, String> = env::vars().collect();
-    let env_json_str = serde_json::to_string(&env_vars)?;
-    args.push(env_json_str);
+    // Scan env vars locally for vt:// patterns — only those values enter the
+    // decrypt pipeline. Env var names and non-vt values never leave this process.
+    let vt_pattern = regex::Regex::new(r"vt://[^/]+/[A-Za-z0-9_-]+").unwrap();
+    let env_vt_vars: Vec<(String, String)> = env::vars()
+        .filter(|(_, v)| vt_pattern.is_match(v))
+        .collect();
+    for (_, value) in &env_vt_vars {
+        args.push(value.clone());
+    }
 
     let mut decrypted_args = decrypt_from_multi_str(vt_client, args, original_command).await?;
 
-    let decrypted_env_json_str = decrypted_args.pop().unwrap();
-    let env_map: HashMap<String, String> = serde_json::from_str(&decrypted_env_json_str).unwrap();
-    for (key, value) in env_map {
-        env::set_var(key, value);
+    // Pop decrypted env var values (in reverse push order) and set only those.
+    for (key, _) in env_vt_vars.iter().rev() {
+        let decrypted_value = decrypted_args.pop().unwrap();
+        env::set_var(key, decrypted_value);
     }
 
     if let Some(replace_file_path) = &replace_file {
