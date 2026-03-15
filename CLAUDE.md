@@ -18,7 +18,7 @@ VT (Vault) is a macOS-based KMS using the system keychain for secret storage and
 
 ### Source Files (src/)
 
-- **main.rs** — CLI entry point (clap). Subcommands: `serve`, `init`, `create`, `read`, `inject`, `secret {export,import,rotate-passcode}`, `ssh {agent,add,list,remove,remove-all,comment,show}`. Server-side commands (`serve`, `init`, `secret`, `ssh`) are `#[cfg(target_os = "macos")]`.
+- **main.rs** — CLI entry point (clap). Subcommands: `serve`, `init`, `create`, `read`, `inject`, `auth`, `secret {export,import,rotate-passcode}`, `ssh {agent,add,list,remove,remove-all,comment,show}`. Server-side commands (`serve`, `init`, `secret`, `ssh`) are `#[cfg(target_os = "macos")]`. `auth` is platform-agnostic (client runs on Linux, agent runs on macOS).
 - **core.rs** — Shared domain types (`EncryptItem`, `DecryptReq`, `CryptoResItem`, `SecretType`) and crypto logic (`do_encrypt`, `do_decrypt`). Used by both `serve.rs` and `ssh_agent.rs`.
 - **serve.rs** — Axum HTTP server with `/encrypt` and `/decrypt` POST endpoints. Auth middleware encrypts/decrypts the entire request and response body using `VT_AUTH`-derived key, including error responses (all post-auth responses are encrypted; pre-auth errors return generic plaintext). Decrypt requires Touch ID/local auth. Also spawns the SSH agent as a background tokio task on startup.
 - **cli.rs** — Client logic. `VTClient` sends body-encrypted requests; error responses are decrypted if possible (post-auth), falling back to raw bytes (pre-auth). `inject` uses `libc::fork()` for timed file cleanup and `exec::Command` to replace the process.
@@ -37,7 +37,8 @@ SSH keys are stored encrypted in the macOS keychain using the same `mac_cipher` 
 - **Agent socket**: `~/.ssh/vt.sock` — Unix domain socket, cleaned up on SIGINT/SIGTERM
 - **Eager loading**: All keys loaded into `Arc<RwLock<HashMap>>` at agent startup
 - **Touch ID**: Required for `sign()` and `decrypt@vt` requests; listing keys does not require auth. After idle timeout, keys are silently reloaded on demand but `request_identities` returns empty until then; the normal auth cache rules enforce Touch ID on the subsequent `sign`/extension request.
-- **Auth caching**: Optional per-session (by TTY device) or per-app (by `.app` ancestor PID) caching of Touch ID authorization. Configured via `--ssh-auth-cache-mode` (`none`/`per-session`/`per-app`) and `--ssh-auth-cache-duration` (seconds). Cache is cleared on agent lock. A background sweeper removes expired entries.
+- **Auth caching**: Optional per-session (by TTY device) or per-app (by `.app` ancestor PID) caching of Touch ID authorization. Configured via `--ssh-auth-cache-mode` (`none`/`per-session`/`per-app`) and `--ssh-auth-cache-duration` (seconds). Cache is cleared on agent lock. A background sweeper removes expired entries. Note: `auth@vt` extension always prompts Touch ID (no caching) because over forwarded agents all remote sessions share the same local process.
+- **Bio auth extension**: `auth@vt` extension triggers Touch ID without encrypting/decrypting data. Used for remote sudo via PAM. See `docs/pam-sudo-setup.md`.
 - **Factory/Session split**: `VtSshAgentFactory` implements `Agent<UnixListener>` to extract peer PID via `LOCAL_PEERPID` socket option. Each connection gets a `VtSshSession` with the peer PID for process-aware auth caching.
 - **Process introspection**: `proc_info` module uses `proc_pidinfo(PROC_PIDTBSDINFO)` for parent PID / TTY device and `proc_pidpath()` for executable path. Used for auth cache context resolution and displaying the calling process name in Touch ID prompts.
 

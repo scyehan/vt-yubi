@@ -85,6 +85,12 @@ enum Commands {
         args: Vec<String>,
     },
 
+    /// Trigger bio auth on the vt server (for use with PAM, sudo, etc.)
+    Auth {
+        #[arg(long, help = "Reason shown in the bio auth prompt")]
+        reason: Option<String>,
+    },
+
     #[cfg(target_os = "macos")]
     /// (Mac only) Run vt server
     Serve {
@@ -252,6 +258,15 @@ async fn run(cli: Cli) -> Result<()> {
             let auth = require_auth(&cli.auth)?;
             let vt_client = VTClient::new(cli.addr.clone(), auth);
             cli::read(vt_client, vt.to_string()).await
+        }
+        Commands::Auth { reason } => {
+            let auth = require_auth(&cli.auth)?;
+            let vt_client = VTClient::new(cli.addr.clone(), auth);
+            cli::auth(
+                vt_client,
+                reason.as_deref().unwrap_or("bio auth requested"),
+            )
+            .await
         }
         Commands::Inject {
             replace_file,

@@ -18,6 +18,17 @@ pub struct DecryptReq {
     pub items: Vec<String>,
 }
 
+#[derive(Deserialize, Serialize)]
+pub struct AuthReq {
+    pub host: String,
+    pub reason: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct AuthRes {
+    pub approved: bool,
+}
+
 #[derive(Deserialize, Serialize, Debug)]
 pub struct CryptoResItem {
     pub result: String,

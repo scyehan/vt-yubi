@@ -4,7 +4,7 @@ use crate::security::{
     create_and_save_passcode_passphrase, decode_auth_cipher_from_b64, get_keychain,
     load_passcode_ciphers, local_authentication, AesGcmCrypto,
 };
-use crate::core::{CryptoResItem, DecryptReq, EncryptItem, SecretType};
+use crate::core::{AuthReq, AuthRes, CryptoResItem, DecryptReq, EncryptItem, SecretType};
 use anyhow::{ensure, Context, Result};
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -161,6 +161,40 @@ impl VTClient {
         }
         self.authed_request("/decrypt", req).await
     }
+
+    pub async fn auth(&self, reason: &str) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let req = AuthReq {
+                host: get_hostname(),
+                reason: reason.to_string(),
+            };
+            let payload = serde_json::to_vec(&req)?;
+            let auth_token = self.auth_token.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                Self::try_agent_extension(&auth_token, "auth@vt", &payload)
+            })
+            .await??;
+
+            match result {
+                Some(bytes) => {
+                    let _res: AuthRes =
+                        serde_json::from_slice(&bytes).context("Failed to parse auth response")?;
+                    return Ok(());
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "SSH agent not available — need agent forwarding or ~/.ssh/vt.sock"
+                    ));
+                }
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            Err(anyhow::anyhow!("vt auth requires Unix (SSH agent socket)"))
+        }
+    }
 }
 
 fn prompt_input_password(prompt_before: &str, prompt_after: &str) -> Result<String> {
@@ -221,6 +255,10 @@ pub fn get_hostname() -> String {
 pub fn is_ip_address(addr: &str) -> bool {
     let host = addr.split(':').next().unwrap_or(addr);
     host.split('.').count() == 4 && host.split('.').all(|num| num.parse::<u8>().is_ok())
+}
+
+pub async fn auth(vt_client: VTClient, reason: &str) -> Result<()> {
+    vt_client.auth(reason).await
 }
 
 pub async fn read(vt_client: VTClient, vt: String) -> Result<()> {

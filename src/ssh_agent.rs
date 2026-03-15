@@ -20,7 +20,7 @@ use crate::security::{
     get_keychain, load_mac_cipher, load_passcode_ciphers, local_authentication, set_keychain,
     AesGcmCrypto,
 };
-use crate::core::{do_decrypt, do_encrypt, CryptoResItem, DecryptReq, EncryptItem};
+use crate::core::{do_decrypt, do_encrypt, AuthReq, AuthRes, CryptoResItem, DecryptReq, EncryptItem};
 
 fn agent_err(e: anyhow::Error) -> AgentError {
     AgentError::Other(Box::new(std::io::Error::new(
@@ -616,7 +616,7 @@ impl Session for VtSshSession {
         drop(locked);
 
         // Only handle vt custom protocol extensions; ignore standard SSH extensions
-        if extension.name != "encrypt@vt" && extension.name != "decrypt@vt" {
+        if extension.name != "encrypt@vt" && extension.name != "decrypt@vt" && extension.name != "auth@vt" {
             // Return None to indicate unsupported extension (not an error)
             return Ok(None);
         }
@@ -660,6 +660,29 @@ impl Session for VtSshSession {
                 }
                 let mac_cipher = load_mac_cipher(&passphrase_cipher).map_err(agent_err)?;
                 let result: Vec<CryptoResItem> = do_decrypt(&mac_cipher, req.items);
+                serde_json::to_vec(&result).map_err(|e| agent_err(e.into()))?
+            }
+            "auth@vt" => {
+                let req: AuthReq =
+                    serde_json::from_slice(&decrypted).map_err(|e| agent_err(e.into()))?;
+
+                // Sanitize untrusted remote strings: strip control chars, truncate
+                let sanitize = |s: &str| -> String {
+                    s.chars().filter(|c| !c.is_control()).take(100).collect()
+                };
+                let reason = sanitize(&req.reason);
+                let host = sanitize(&req.host);
+
+                let auth_message = format!("bio auth: {} from {}", reason, host);
+
+                // Always prompt Touch ID — no auth caching for auth@vt.
+                // Over forwarded agents, all remote sessions share the same local
+                // process, so caching would approve all sudo from any session.
+                if !local_authentication(&auth_message) {
+                    return Err(AgentError::Failure);
+                }
+
+                let result = AuthRes { approved: true };
                 serde_json::to_vec(&result).map_err(|e| agent_err(e.into()))?
             }
             _ => unreachable!(),
