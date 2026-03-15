@@ -93,29 +93,37 @@ impl std::fmt::Display for AuthCacheMode {
 }
 
 pub struct AuthCache {
+    /// Each entry stores when it expires (computed at grant time).
     entries: HashMap<(u64, String), Instant>,
-    duration: Duration,
+    sign_duration: Duration,
+    decrypt_duration: Duration,
 }
 
 impl AuthCache {
-    pub fn new(duration_secs: u64) -> Self {
+    pub fn new(sign_duration_secs: u64, decrypt_duration_secs: u64) -> Self {
         Self {
             entries: HashMap::new(),
-            duration: Duration::from_secs(duration_secs),
+            sign_duration: Duration::from_secs(sign_duration_secs),
+            decrypt_duration: Duration::from_secs(decrypt_duration_secs),
         }
     }
 
     pub fn is_authorized(&self, context_id: u64, fingerprint: &str) -> bool {
-        if let Some(grant_time) = self.entries.get(&(context_id, fingerprint.to_string())) {
-            grant_time.elapsed() < self.duration
+        if let Some(expires_at) = self.entries.get(&(context_id, fingerprint.to_string())) {
+            Instant::now() < *expires_at
         } else {
             false
         }
     }
 
-    pub fn grant(&mut self, context_id: u64, fingerprint: &str) {
+    pub fn grant(&mut self, context_id: u64, fingerprint: &str, is_decrypt: bool) {
+        let ttl = if is_decrypt {
+            self.decrypt_duration
+        } else {
+            self.sign_duration
+        };
         self.entries
-            .insert((context_id, fingerprint.to_string()), Instant::now());
+            .insert((context_id, fingerprint.to_string()), Instant::now() + ttl);
     }
 
     pub fn clear(&mut self) {
@@ -123,8 +131,8 @@ impl AuthCache {
     }
 
     pub fn sweep_expired(&mut self) {
-        self.entries
-            .retain(|_, grant_time| grant_time.elapsed() < self.duration);
+        let now = Instant::now();
+        self.entries.retain(|_, expires_at| now < *expires_at);
     }
 }
 
@@ -262,8 +270,10 @@ fn hash_lock_passphrase(passphrase: &str) -> [u8; 32] {
 
 /// Default idle timeout: 30 minutes.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
-/// Default auth cache duration: 5 minutes.
+/// Default auth cache duration for sign: 5 minutes.
 pub const DEFAULT_AUTH_CACHE_DURATION_SECS: u64 = 300;
+/// Default auth cache duration for decrypt: 1 minute.
+pub const DEFAULT_DECRYPT_CACHE_DURATION_SECS: u64 = 60;
 
 /// Load mac_cipher on demand from keychain (avoids keeping the master key in memory).
 fn load_cipher_from_keychain() -> Result<AesGcmCrypto> {
@@ -337,6 +347,7 @@ impl VtSshAgentFactory {
         keys: HashMap<String, PrivateKey>,
         cache_mode: AuthCacheMode,
         cache_duration_secs: u64,
+        decrypt_cache_duration_secs: u64,
     ) -> Self {
         Self {
             keys: Arc::new(RwLock::new(keys)),
@@ -344,7 +355,10 @@ impl VtSshAgentFactory {
             locked: Arc::new(RwLock::new(false)),
             lock_passphrase: Arc::new(RwLock::new(None)),
             idle_cleared: Arc::new(RwLock::new(false)),
-            auth_cache: Arc::new(RwLock::new(AuthCache::new(cache_duration_secs))),
+            auth_cache: Arc::new(RwLock::new(AuthCache::new(
+                cache_duration_secs,
+                decrypt_cache_duration_secs,
+            ))),
             cache_mode,
         }
     }
@@ -418,7 +432,13 @@ impl VtSshSession {
     }
 
     /// Check auth cache or prompt Touch ID. Returns true if authorized.
-    async fn check_or_prompt_auth(&self, fingerprint: &str, auth_message: &str) -> bool {
+    /// `is_decrypt` selects the decrypt cache duration (shorter) vs sign duration.
+    async fn check_or_prompt_auth(
+        &self,
+        fingerprint: &str,
+        auth_message: &str,
+        is_decrypt: bool,
+    ) -> bool {
         let context_id = match self.cache_mode {
             AuthCacheMode::None => {
                 return local_authentication(auth_message);
@@ -454,7 +474,7 @@ impl VtSshSession {
         // Grant cache entry (write lock)
         {
             let mut cache = self.auth_cache.write().await;
-            cache.grant(context_id, fingerprint);
+            cache.grant(context_id, fingerprint, is_decrypt);
             tracing::debug!(
                 "Auth cache grant for context={} fingerprint={}",
                 context_id,
@@ -523,7 +543,10 @@ impl Session for VtSshSession {
         };
 
         // Check auth cache or prompt Touch ID
-        if !self.check_or_prompt_auth(&fp_str, &auth_message).await {
+        if !self
+            .check_or_prompt_auth(&fp_str, &auth_message, false)
+            .await
+        {
             return Err(AgentError::Failure);
         }
 
@@ -653,7 +676,7 @@ impl Session for VtSshSession {
                 );
                 // Check auth cache or prompt Touch ID
                 if !self
-                    .check_or_prompt_auth("decrypt@vt", &local_auth_message)
+                    .check_or_prompt_auth("decrypt@vt", &local_auth_message, true)
                     .await
                 {
                     return Err(AgentError::Failure);
@@ -839,6 +862,7 @@ pub async fn run_ssh_agent(
     idle_timeout_secs: u64,
     cache_mode: AuthCacheMode,
     cache_duration_secs: u64,
+    decrypt_cache_duration_secs: u64,
 ) -> Result<()> {
     let idle_timeout = Duration::from_secs(idle_timeout_secs);
 
@@ -868,7 +892,8 @@ pub async fn run_ssh_agent(
         println!("echo Agent pid {};", std::process::id());
     }
 
-    let factory = VtSshAgentFactory::new(keys, cache_mode, cache_duration_secs);
+    let factory =
+        VtSshAgentFactory::new(keys, cache_mode, cache_duration_secs, decrypt_cache_duration_secs);
 
     // Spawn idle sweeper that clears keys from memory after inactivity
     let sweeper_keys = Arc::clone(&factory.keys);
@@ -909,9 +934,10 @@ pub async fn run_ssh_agent(
             }
         });
         tracing::info!(
-            "Auth cache: mode={}, duration={}s",
+            "Auth cache: mode={}, sign={}s, decrypt={}s",
             cache_mode,
-            cache_duration_secs
+            cache_duration_secs,
+            decrypt_cache_duration_secs
         );
     }
 
@@ -952,8 +978,16 @@ pub async fn start_ssh_agent(
     idle_timeout_secs: u64,
     cache_mode: AuthCacheMode,
     cache_duration_secs: u64,
+    decrypt_cache_duration_secs: u64,
 ) -> Result<()> {
-    run_ssh_agent(true, idle_timeout_secs, cache_mode, cache_duration_secs).await
+    run_ssh_agent(
+        true,
+        idle_timeout_secs,
+        cache_mode,
+        cache_duration_secs,
+        decrypt_cache_duration_secs,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1080,17 +1114,17 @@ mod tests {
 
     #[test]
     fn test_auth_cache_grant_and_hit() {
-        let mut cache = AuthCache::new(300);
+        let mut cache = AuthCache::new(300, 60);
         assert!(!cache.is_authorized(1, "fp1"));
 
-        cache.grant(1, "fp1");
+        cache.grant(1, "fp1", false);
         assert!(cache.is_authorized(1, "fp1"));
     }
 
     #[test]
     fn test_auth_cache_different_context_misses() {
-        let mut cache = AuthCache::new(300);
-        cache.grant(1, "fp1");
+        let mut cache = AuthCache::new(300, 60);
+        cache.grant(1, "fp1", false);
 
         // Same fingerprint, different context
         assert!(!cache.is_authorized(2, "fp1"));
@@ -1100,8 +1134,8 @@ mod tests {
 
     #[test]
     fn test_auth_cache_expiry() {
-        let mut cache = AuthCache::new(0); // 0 second duration = immediately expired
-        cache.grant(1, "fp1");
+        let mut cache = AuthCache::new(0, 0); // 0 second duration = immediately expired
+        cache.grant(1, "fp1", false);
 
         // With 0 duration, entries expire immediately
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1109,10 +1143,37 @@ mod tests {
     }
 
     #[test]
+    fn test_auth_cache_decrypt_expiry() {
+        // sign=300s, decrypt=0s — decrypt entries expire immediately while sign survives
+        let mut cache = AuthCache::new(300, 0);
+        cache.grant(1, "fp1", false); // sign
+        cache.grant(2, "decrypt@vt", true); // decrypt
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(cache.is_authorized(1, "fp1")); // sign still valid
+        assert!(!cache.is_authorized(2, "decrypt@vt")); // decrypt expired
+    }
+
+    #[test]
+    fn test_auth_cache_sweep_mixed_expiry() {
+        // sign=300s, decrypt=0s
+        let mut cache = AuthCache::new(300, 0);
+        cache.grant(1, "fp1", false); // sign — long TTL
+        cache.grant(2, "decrypt@vt", true); // decrypt — immediate expiry
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        cache.sweep_expired();
+        // sign entry survives, decrypt entry swept
+        assert!(cache.is_authorized(1, "fp1"));
+        assert!(!cache.is_authorized(2, "decrypt@vt"));
+        assert_eq!(cache.entries.len(), 1);
+    }
+
+    #[test]
     fn test_auth_cache_clear() {
-        let mut cache = AuthCache::new(300);
-        cache.grant(1, "fp1");
-        cache.grant(2, "fp2");
+        let mut cache = AuthCache::new(300, 60);
+        cache.grant(1, "fp1", false);
+        cache.grant(2, "fp2", true);
         assert!(cache.is_authorized(1, "fp1"));
 
         cache.clear();
@@ -1122,9 +1183,9 @@ mod tests {
 
     #[test]
     fn test_auth_cache_sweep_expired() {
-        let mut cache = AuthCache::new(0); // 0 second = immediately expired
-        cache.grant(1, "fp1");
-        cache.grant(2, "fp2");
+        let mut cache = AuthCache::new(0, 0); // 0 second = immediately expired
+        cache.grant(1, "fp1", false);
+        cache.grant(2, "fp2", true);
 
         std::thread::sleep(std::time::Duration::from_millis(10));
         cache.sweep_expired();

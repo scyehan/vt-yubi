@@ -115,9 +115,15 @@ enum Commands {
         #[arg(
             long = "ssh-auth-cache-duration",
             default_value_t = ssh_agent::DEFAULT_AUTH_CACHE_DURATION_SECS,
-            help = "Auth cache duration in seconds"
+            help = "Auth cache duration in seconds for sign operations"
         )]
         auth_cache_duration: u64,
+        #[arg(
+            long = "ssh-decrypt-cache-duration",
+            default_value_t = ssh_agent::DEFAULT_DECRYPT_CACHE_DURATION_SECS,
+            help = "Auth cache duration in seconds for decrypt operations"
+        )]
+        decrypt_cache_duration: u64,
     },
     /// (Mac only) Initialize passcode, passphrase which will be used by server
     #[cfg(target_os = "macos")]
@@ -167,9 +173,15 @@ pub enum SshCommands {
         #[arg(
             long = "ssh-auth-cache-duration",
             default_value_t = ssh_agent::DEFAULT_AUTH_CACHE_DURATION_SECS,
-            help = "Auth cache duration in seconds"
+            help = "Auth cache duration in seconds for sign operations"
         )]
         auth_cache_duration: u64,
+        #[arg(
+            long = "ssh-decrypt-cache-duration",
+            default_value_t = ssh_agent::DEFAULT_DECRYPT_CACHE_DURATION_SECS,
+            help = "Auth cache duration in seconds for decrypt operations"
+        )]
+        decrypt_cache_duration: u64,
     },
     /// Add an SSH private key to the keychain
     Add {
@@ -214,6 +226,7 @@ async fn run(cli: Cli) -> Result<()> {
                 ssh_idle_timeout,
                 auth_cache_mode,
                 auth_cache_duration,
+                decrypt_cache_duration,
             } => {
                 serve::serve(
                     cli.addr.as_deref().unwrap_or("127.0.0.1:5757"),
@@ -221,6 +234,7 @@ async fn run(cli: Cli) -> Result<()> {
                     *ssh_idle_timeout,
                     *auth_cache_mode,
                     *auth_cache_duration,
+                    *decrypt_cache_duration,
                 )
                 .await
             }
@@ -241,7 +255,16 @@ async fn run(cli: Cli) -> Result<()> {
                 timeout,
                 auth_cache_mode,
                 auth_cache_duration,
-            } => ssh_agent::start_ssh_agent(*timeout, *auth_cache_mode, *auth_cache_duration).await,
+                decrypt_cache_duration,
+            } => {
+                ssh_agent::start_ssh_agent(
+                    *timeout,
+                    *auth_cache_mode,
+                    *auth_cache_duration,
+                    *decrypt_cache_duration,
+                )
+                .await
+            }
             SshCommands::Add { file, comment } => ssh_cli::ssh_add(file.clone(), comment.clone()),
             SshCommands::List => ssh_cli::ssh_list(),
             SshCommands::Remove { fingerprint } => ssh_cli::ssh_remove(fingerprint),

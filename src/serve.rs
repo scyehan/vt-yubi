@@ -145,6 +145,7 @@ pub async fn serve(
     ssh_idle_timeout: u64,
     auth_cache_mode: crate::ssh_agent::AuthCacheMode,
     auth_cache_duration: u64,
+    decrypt_cache_duration: u64,
 ) -> Result<()> {
     let (auth_cipher, passphrase_cipher) =
         load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
@@ -156,6 +157,7 @@ pub async fn serve(
             ssh_idle_timeout,
             auth_cache_mode,
             auth_cache_duration,
+            decrypt_cache_duration,
         )
         .await
         {
