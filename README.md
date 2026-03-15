@@ -10,6 +10,7 @@ A simple KMS solution based on macOS keychain. No plaintext secrets, explicit au
 - TOTP support for time-based one-time passwords
 - Environment variable and file injection with automatic cleanup
 - SSH agent with Touch ID gated signing (Ed25519, RSA, ECDSA P-256/P-384) and optional per-session/per-app auth caching
+- Remote sudo via Touch ID through SSH agent forwarding
 
 ## Installation
 
@@ -58,6 +59,7 @@ cp target/release/vt /usr/local/bin/
 | `create` | Read plaintext from stdin, output encrypted vt protocol |
 | `read <vt>` | Decrypt a vt protocol string |
 | `inject` | Decrypt vt protocols in env/files, optionally run a command |
+| `auth [--reason <text>]` | Trigger bio auth via SSH agent forwarding (for PAM/sudo) |
 | `secret export` | (macOS) Export the encrypted master secret |
 | `secret import` | (macOS) Import an encrypted master secret |
 | `secret rotate-passcode` | (macOS) Rotate the passcode for the master secret |
@@ -146,6 +148,67 @@ By default, Touch ID is required for every sign/decrypt request. You can enable 
 | Per-app | `per-app` | Shared within same application (e.g., Terminal.app) |
 
 `--ssh-auth-cache-duration <SECONDS>` controls how long a grant lasts (default: 300s). The cache is cleared when the agent is locked.
+
+### Remote sudo via Touch ID
+
+Use `vt auth` to trigger Touch ID on your macOS when running `sudo` on a remote Linux server. If macOS is unreachable or Touch ID is rejected, sudo falls back to password.
+
+```
+macOS (vt SSH agent)  ◄──SSH agent forwarding──  Linux: sudo
+       │                                            │
+   Touch ID prompt                              PAM → vt auth
+       │                                            │
+   approve/reject   ──────────────────────────►  proceed/fallback to password
+```
+
+**Setup on macOS:**
+
+```bash
+# Ensure vt agent is your SSH agent
+export SSH_AUTH_SOCK=~/.ssh/vt.sock
+vt serve  # or: vt ssh agent
+
+# SSH with agent forwarding
+ssh -A user@your-server
+```
+
+**Setup on the remote Linux server:**
+
+Install the `vt` binary, then run the setup script:
+
+```bash
+sudo VT_AUTH="your-token" ./setup-pam.sh
+```
+
+Or configure manually:
+
+1. Create `/usr/local/bin/vt-sudo-auth.sh` (root:root, chmod 700):
+   ```bash
+   #!/bin/bash
+   export VT_AUTH="your-base64-token-here"
+   # pam_exec doesn't inherit user's env; read SSH_AUTH_SOCK from /proc
+   if [ -z "$SSH_AUTH_SOCK" ]; then
+       SUDO_PID=$PPID
+       USER_PID=$(awk '/^PPid:/{print $2}' /proc/$SUDO_PID/status 2>/dev/null)
+       if [ -n "$USER_PID" ]; then
+           SSH_AUTH_SOCK=$(tr '\0' '\n' < /proc/$USER_PID/environ 2>/dev/null | sed -n 's/^SSH_AUTH_SOCK=//p')
+           export SSH_AUTH_SOCK
+       fi
+   fi
+   if [ -z "$SSH_AUTH_SOCK" ]; then exit 1; fi
+   timeout 30 /usr/local/bin/vt auth \
+       --reason "sudo ${PAM_SERVICE:-sudo} by ${PAM_USER:-unknown}" 2>/dev/null
+   ```
+
+2. Edit `/etc/pam.d/sudo`, add **before** `@include common-auth`:
+   ```
+   auth    sufficient    pam_exec.so seteuid quiet /usr/local/bin/vt-sudo-auth.sh
+   ```
+
+**Security notes:**
+- `auth@vt` always prompts Touch ID (no caching) — over forwarded agents, all remote sessions share the same local process
+- `VT_AUTH` in the helper script is a full credential (also authorizes encrypt/decrypt) — keep the script root-only
+- `sufficient` means Touch ID success skips password; failure falls through to password prompt
 
 ## VT Protocol Format
 

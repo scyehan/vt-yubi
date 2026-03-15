@@ -38,7 +38,7 @@ SSH keys are stored encrypted in the macOS keychain using the same `mac_cipher` 
 - **Eager loading**: All keys loaded into `Arc<RwLock<HashMap>>` at agent startup
 - **Touch ID**: Required for `sign()` and `decrypt@vt` requests; listing keys does not require auth. After idle timeout, keys are silently reloaded on demand but `request_identities` returns empty until then; the normal auth cache rules enforce Touch ID on the subsequent `sign`/extension request.
 - **Auth caching**: Optional per-session (by TTY device) or per-app (by `.app` ancestor PID) caching of Touch ID authorization. Configured via `--ssh-auth-cache-mode` (`none`/`per-session`/`per-app`) and `--ssh-auth-cache-duration` (seconds). Cache is cleared on agent lock. A background sweeper removes expired entries. Note: `auth@vt` extension always prompts Touch ID (no caching) because over forwarded agents all remote sessions share the same local process.
-- **Bio auth extension**: `auth@vt` extension triggers Touch ID without encrypting/decrypting data. Used for remote sudo via PAM. See `docs/pam-sudo-setup.md`.
+- **Bio auth extension**: `auth@vt` extension triggers Touch ID without encrypting/decrypting data. Used for remote sudo via PAM. See README for setup.
 - **Factory/Session split**: `VtSshAgentFactory` implements `Agent<UnixListener>` to extract peer PID via `LOCAL_PEERPID` socket option. Each connection gets a `VtSshSession` with the peer PID for process-aware auth caching.
 - **Process introspection**: `proc_info` module uses `proc_pidinfo(PROC_PIDTBSDINFO)` for parent PID / TTY device and `proc_pidpath()` for executable path. Used for auth cache context resolution and displaying the calling process name in Touch ID prompts.
 
