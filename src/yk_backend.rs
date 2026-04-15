@@ -301,7 +301,6 @@ pub fn yubikey_init_with_pubkey(pubkey_path: &str) -> Result<String> {
     // This also implicitly checks that PIN + touch work before we commit any files.
     tracing::info!("Verifying provided public key matches YubiKey's private key...");
     let mut yk = YubiKey::open().context("Failed to open YubiKey. Is it plugged in?")?;
-    let serial = yk.serial().0;
 
     let pin = rpassword::prompt_password("YubiKey PIN: ").context("Failed to read PIN")?;
     let pin = pin.trim().to_string();
@@ -336,8 +335,10 @@ pub fn yubikey_init_with_pubkey(pubkey_path: &str) -> Result<String> {
     write_ecies_file(&auth_token_path()?, &enc_auth_token)?;
     tracing::info!("Auth token encrypted and saved");
 
+    // Serial intentionally stored as 0 — shared-key setups plug in different YubiKeys
+    // with the same imported PIV key, so enforcing one specific serial defeats the purpose.
     save_config(&VtYubiConfig {
-        yubikey_serial: serial,
+        yubikey_serial: 0,
         piv_public_key_der: pubkey_der,
     })?;
 
@@ -382,10 +383,13 @@ pub fn open_and_verify_pin() -> Result<(YubiKey, String)> {
     let config = load_config()?;
     let mut yk = YubiKey::open().context("Failed to open YubiKey. Is it plugged in?")?;
 
-    // Verify serial matches
-    if yk.serial().0 != config.yubikey_serial {
-        anyhow::bail!(
-            "YubiKey serial mismatch: expected {}, got {}",
+    // Serial check is a soft hint — real authority is the PIV private key.
+    // yubikey_serial == 0 means "any serial OK" (set by init --pubkey for shared keys).
+    // Otherwise a mismatch is just a warning; ECDH will fail cleanly if the wrong key is used.
+    if config.yubikey_serial != 0 && yk.serial().0 != config.yubikey_serial {
+        tracing::warn!(
+            "YubiKey serial mismatch: config expects {}, got {}. Continuing anyway — \
+             decryption will still fail if the PIV key doesn't match.",
             config.yubikey_serial,
             yk.serial().0
         );
