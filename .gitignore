@@ -1,3 +1,5 @@
 /.vscode
 /target
 GEMINI.md
+/.claude
+/env.sh
