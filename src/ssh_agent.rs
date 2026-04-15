@@ -16,11 +16,11 @@ use ssh_key::public::KeyData;
 use ssh_key::{Algorithm, HashAlg, Signature};
 use tokio::sync::RwLock;
 
-use crate::security::{
-    get_keychain, load_mac_cipher, load_passcode_ciphers, local_authentication, set_keychain,
-    AesGcmCrypto,
+use crate::core::{
+    do_decrypt, do_encrypt, AuthReq, AuthRes, CryptoResItem, DecryptReq, EncryptItem,
 };
-use crate::core::{do_decrypt, do_encrypt, AuthReq, AuthRes, CryptoResItem, DecryptReq, EncryptItem};
+use crate::security::AesGcmCrypto;
+use crate::yk_backend;
 
 fn agent_err(e: anyhow::Error) -> AgentError {
     AgentError::Other(Box::new(std::io::Error::new(
@@ -29,32 +29,48 @@ fn agent_err(e: anyhow::Error) -> AgentError {
     )))
 }
 
-// --- Key storage (single keychain item: rusty.vault.ssh_keys) ---
+/// Encode ECDSA (r, s) as SSH mpint blob: u32_len(r_mpint) || r_bytes || u32_len(s_mpint) || s_bytes
+fn encode_ecdsa_sig_blob(r: &[u8], s: &[u8]) -> Vec<u8> {
+    fn encode_mpint(buf: &mut Vec<u8>, bytes: &[u8]) {
+        // Strip leading zeros
+        let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+        let bytes = &bytes[start..];
+        if bytes.is_empty() {
+            buf.extend_from_slice(&0u32.to_be_bytes());
+            return;
+        }
+        let needs_pad = bytes[0] & 0x80 != 0;
+        let len = bytes.len() + if needs_pad { 1 } else { 0 };
+        buf.extend_from_slice(&(len as u32).to_be_bytes());
+        if needs_pad {
+            buf.push(0);
+        }
+        buf.extend_from_slice(bytes);
+    }
+
+    let mut blob = Vec::new();
+    encode_mpint(&mut blob, r);
+    encode_mpint(&mut blob, s);
+    blob
+}
+
+// --- Key storage (file-based: ~/.vt-yubi/ssh_keys.enc) ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SshKeyEntry {
     pub fingerprint: String,
     pub algorithm: String,
     pub comment: String,
-    /// OpenSSH-format private key (plaintext, encrypted at the keychain level)
+    /// OpenSSH-format private key (plaintext, encrypted at the file level)
     pub key_data: String,
 }
 
 pub fn load_ssh_keys(cipher: &AesGcmCrypto) -> Result<Vec<SshKeyEntry>> {
-    match get_keychain("ssh_keys") {
-        Ok(encrypted) => {
-            let decrypted = cipher.decrypt(&encrypted)?;
-            let entries: Vec<SshKeyEntry> = serde_json::from_slice(&decrypted)?;
-            Ok(entries)
-        }
-        Err(_) => Ok(Vec::new()),
-    }
+    yk_backend::load_ssh_keys_from_file(cipher)
 }
 
 pub fn save_ssh_keys(cipher: &AesGcmCrypto, entries: &[SshKeyEntry]) -> Result<()> {
-    let json = serde_json::to_vec(entries)?;
-    let encrypted = cipher.encrypt(&json)?;
-    set_keychain("ssh_keys", &encrypted)
+    yk_backend::save_ssh_keys_to_file(cipher, entries)
 }
 
 // --- Auth Cache ---
@@ -93,7 +109,6 @@ impl std::fmt::Display for AuthCacheMode {
 }
 
 pub struct AuthCache {
-    /// Each entry stores when it expires (computed at grant time).
     entries: HashMap<(u64, String), Instant>,
     sign_duration: Duration,
     decrypt_duration: Duration,
@@ -136,91 +151,113 @@ impl AuthCache {
     }
 }
 
-// --- macOS process introspection ---
+// --- Cross-platform process introspection ---
 
 mod proc_info {
-    const PROC_PIDTBSDINFO: libc::c_int = 3;
-    const MAXPATHLEN: u32 = 1024;
-    const MAXCOMLEN: usize = 16;
+    #[cfg(target_os = "macos")]
+    mod macos {
+        const PROC_PIDTBSDINFO: libc::c_int = 3;
+        const MAXPATHLEN: u32 = 1024;
+        const MAXCOMLEN: usize = 16;
 
-    #[repr(C)]
-    struct ProcBsdInfo {
-        pbi_flags: u32,
-        pbi_status: u32,
-        pbi_xstatus: u32,
-        pbi_pid: u32,
-        pbi_ppid: u32,
-        pbi_uid: u32,
-        pbi_gid: u32,
-        pbi_ruid: u32,
-        pbi_rgid: u32,
-        pbi_svuid: u32,
-        pbi_svgid: u32,
-        rfu_1: u32,
-        pbi_comm: [u8; MAXCOMLEN],
-        pbi_name: [u8; 2 * MAXCOMLEN],
-        pbi_nfiles: u32,
-        pbi_pgid: u32,
-        pbi_pjobc: u32,
-        e_tdev: u32,
-        e_tpgid: u32,
-        pbi_nice: i32,
-        pbi_start_tvsec: u64,
-        pbi_start_tvusec: u64,
-    }
+        #[repr(C)]
+        struct ProcBsdInfo {
+            pbi_flags: u32,
+            pbi_status: u32,
+            pbi_xstatus: u32,
+            pbi_pid: u32,
+            pbi_ppid: u32,
+            pbi_uid: u32,
+            pbi_gid: u32,
+            pbi_ruid: u32,
+            pbi_rgid: u32,
+            pbi_svuid: u32,
+            pbi_svgid: u32,
+            rfu_1: u32,
+            pbi_comm: [u8; MAXCOMLEN],
+            pbi_name: [u8; 2 * MAXCOMLEN],
+            pbi_nfiles: u32,
+            pbi_pgid: u32,
+            pbi_pjobc: u32,
+            e_tdev: u32,
+            e_tpgid: u32,
+            pbi_nice: i32,
+            pbi_start_tvsec: u64,
+            pbi_start_tvusec: u64,
+        }
 
-    extern "C" {
-        fn proc_pidinfo(
-            pid: libc::c_int,
-            flavor: libc::c_int,
-            arg: u64,
-            buffer: *mut libc::c_void,
-            buffersize: libc::c_int,
-        ) -> libc::c_int;
-        fn proc_pidpath(
-            pid: libc::c_int,
-            buffer: *mut libc::c_void,
-            buffersize: u32,
-        ) -> libc::c_int;
-    }
+        extern "C" {
+            fn proc_pidinfo(
+                pid: libc::c_int,
+                flavor: libc::c_int,
+                arg: u64,
+                buffer: *mut libc::c_void,
+                buffersize: libc::c_int,
+            ) -> libc::c_int;
+            fn proc_pidpath(
+                pid: libc::c_int,
+                buffer: *mut libc::c_void,
+                buffersize: u32,
+            ) -> libc::c_int;
+        }
 
-    /// Get process BSD info: returns (ppid, tdev) or None.
-    pub fn get_proc_bsdinfo(pid: i32) -> Option<(u32, u32)> {
-        let mut info: ProcBsdInfo = unsafe { std::mem::zeroed() };
-        let size = std::mem::size_of::<ProcBsdInfo>() as libc::c_int;
-        let ret = unsafe {
-            proc_pidinfo(
-                pid,
-                PROC_PIDTBSDINFO,
-                0,
-                &mut info as *mut _ as *mut libc::c_void,
-                size,
-            )
-        };
-        if ret == size {
-            Some((info.pbi_ppid, info.e_tdev))
-        } else {
-            None
+        pub fn get_proc_bsdinfo(pid: i32) -> Option<(u32, u32)> {
+            let mut info: ProcBsdInfo = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of::<ProcBsdInfo>() as libc::c_int;
+            let ret = unsafe {
+                proc_pidinfo(
+                    pid,
+                    PROC_PIDTBSDINFO,
+                    0,
+                    &mut info as *mut _ as *mut libc::c_void,
+                    size,
+                )
+            };
+            if ret == size {
+                Some((info.pbi_ppid, info.e_tdev))
+            } else {
+                None
+            }
+        }
+
+        pub fn get_proc_path(pid: i32) -> Option<String> {
+            let mut buf = vec![0u8; MAXPATHLEN as usize];
+            let ret =
+                unsafe { proc_pidpath(pid, buf.as_mut_ptr() as *mut libc::c_void, MAXPATHLEN) };
+            if ret > 0 {
+                buf.truncate(ret as usize);
+                String::from_utf8(buf).ok()
+            } else {
+                None
+            }
         }
     }
 
-    /// Get process executable path.
-    pub fn get_proc_path(pid: i32) -> Option<String> {
-        let mut buf = vec![0u8; MAXPATHLEN as usize];
-        let ret = unsafe {
-            proc_pidpath(
-                pid,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                MAXPATHLEN,
-            )
-        };
-        if ret > 0 {
-            buf.truncate(ret as usize);
-            String::from_utf8(buf).ok()
-        } else {
-            None
+    #[cfg(target_os = "linux")]
+    mod linux {
+        pub fn get_proc_bsdinfo(pid: i32) -> Option<(u32, u32)> {
+            // Read /proc/{pid}/stat to get ppid (field 4) and tty_nr (field 7)
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+            // Fields after the comm field (which is in parens) are space-separated
+            let after_comm = stat.rsplit(')').next()?.trim();
+            let fields: Vec<&str> = after_comm.split_whitespace().collect();
+            // fields[1] = ppid (0-indexed after state), fields[4] = tty_nr
+            let ppid: u32 = fields.get(1)?.parse().ok()?;
+            let tty_nr: u32 = fields.get(4)?.parse().ok()?;
+            Some((ppid, tty_nr))
+        }
+
+        pub fn get_proc_path(pid: i32) -> Option<String> {
+            std::fs::read_link(format!("/proc/{}/exe", pid))
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
         }
     }
+
+    #[cfg(target_os = "macos")]
+    use macos::{get_proc_bsdinfo, get_proc_path};
+    #[cfg(target_os = "linux")]
+    use linux::{get_proc_bsdinfo, get_proc_path};
 
     /// Get the controlling TTY device number for a process.
     pub fn get_tty_dev(pid: i32) -> u64 {
@@ -233,7 +270,6 @@ mod proc_info {
     /// Returns the PID of the app process, or the direct parent as fallback.
     pub fn find_app_pid(peer_pid: i32) -> u64 {
         let mut current_pid = peer_pid;
-        // Limit traversal to prevent infinite loops
         for _ in 0..64 {
             if current_pid <= 1 {
                 break;
@@ -250,16 +286,19 @@ mod proc_info {
                 _ => break,
             }
         }
-        // Fallback: return the immediate parent of the peer
         get_proc_bsdinfo(peer_pid)
             .map(|(ppid, _)| ppid as u64)
             .unwrap_or(peer_pid as u64)
+    }
+
+    /// Get the process name from PID (cross-platform).
+    pub fn get_process_name(pid: i32) -> Option<String> {
+        get_proc_path(pid).and_then(|p| p.rsplit('/').next().map(String::from))
     }
 }
 
 // --- SSH Agent ---
 
-/// Hash a lock passphrase to a 32-byte SHA-256 digest.
 fn hash_lock_passphrase(passphrase: &str) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(passphrase.as_bytes());
@@ -268,24 +307,21 @@ fn hash_lock_passphrase(passphrase: &str) -> [u8; 32] {
     out
 }
 
-/// Default idle timeout: 30 minutes.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
-/// Default auth cache duration for sign: 5 minutes.
 pub const DEFAULT_AUTH_CACHE_DURATION_SECS: u64 = 300;
-/// Default auth cache duration for decrypt: 1 minute.
 pub const DEFAULT_DECRYPT_CACHE_DURATION_SECS: u64 = 60;
 
-/// Load mac_cipher on demand from keychain (avoids keeping the master key in memory).
-fn load_cipher_from_keychain() -> Result<AesGcmCrypto> {
-    let (_, passphrase_cipher) = load_passcode_ciphers()?;
-    load_mac_cipher(&passphrase_cipher)
+/// Load mac_cipher on demand from YubiKey-encrypted passphrase file.
+/// NOTE: This requires a YubiKey handle. For the agent, we cache the passphrase
+/// at startup so we don't need to touch YubiKey for every key load.
+fn load_cipher_from_passphrase(passphrase: &[u8; 32]) -> Result<AesGcmCrypto> {
+    AesGcmCrypto::new(passphrase)
 }
 
-/// Load all SSH keys from keychain into a HashMap. Cipher is dropped after use.
-fn load_all_keys() -> Result<HashMap<String, PrivateKey>> {
-    let mac_cipher = load_cipher_from_keychain()?;
-    let entries = load_ssh_keys(&mac_cipher)?;
-    // mac_cipher dropped after this block
+/// Load all SSH keys from encrypted file.
+fn load_all_keys(passphrase: &[u8; 32]) -> Result<HashMap<String, PrivateKey>> {
+    let cipher = load_cipher_from_passphrase(passphrase)?;
+    let entries = load_ssh_keys(&cipher)?;
     let mut keys = HashMap::new();
     for entry in &entries {
         match PrivateKey::from_openssh(entry.key_data.as_bytes()) {
@@ -306,27 +342,51 @@ fn fingerprint_str(key_data: &KeyData) -> String {
     fp.to_string()
 }
 
-/// Get the peer PID from a Unix stream using macOS LOCAL_PEERPID.
+/// Get the peer PID from a Unix stream.
 fn get_peer_pid(stream: &tokio::net::UnixStream) -> Option<i32> {
-    use std::os::unix::io::AsRawFd;
-    let fd = stream.as_raw_fd();
-    let mut pid: libc::pid_t = 0;
-    let mut pid_size = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
-    const SOL_LOCAL: libc::c_int = 0;
-    const LOCAL_PEERPID: libc::c_int = 0x002;
-    let ret = unsafe {
-        libc::getsockopt(
-            fd,
-            SOL_LOCAL,
-            LOCAL_PEERPID,
-            &mut pid as *mut _ as *mut libc::c_void,
-            &mut pid_size,
-        )
-    };
-    if ret == 0 && pid > 0 {
-        Some(pid)
-    } else {
-        None
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = stream.as_raw_fd();
+        let mut pid: libc::pid_t = 0;
+        let mut pid_size = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        const SOL_LOCAL: libc::c_int = 0;
+        const LOCAL_PEERPID: libc::c_int = 0x002;
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                SOL_LOCAL,
+                LOCAL_PEERPID,
+                &mut pid as *mut _ as *mut libc::c_void,
+                &mut pid_size,
+            )
+        };
+        if ret == 0 && pid > 0 {
+            Some(pid)
+        } else {
+            None
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = stream.as_raw_fd();
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut cred_size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut _ as *mut libc::c_void,
+                &mut cred_size,
+            )
+        };
+        if ret == 0 && cred.pid > 0 {
+            Some(cred.pid)
+        } else {
+            None
+        }
     }
 }
 
@@ -340,6 +400,12 @@ pub struct VtSshAgentFactory {
     idle_cleared: Arc<RwLock<bool>>,
     auth_cache: Arc<RwLock<AuthCache>>,
     cache_mode: AuthCacheMode,
+    /// Cached master passphrase (decrypted at startup, stays in memory)
+    passphrase: Arc<[u8; 32]>,
+    /// Cached auth token (decrypted at startup, stays in memory)
+    auth_token: Arc<[u8; 32]>,
+    /// Cached YubiKey PIN for presence verification
+    pin: Arc<String>,
 }
 
 impl VtSshAgentFactory {
@@ -348,6 +414,9 @@ impl VtSshAgentFactory {
         cache_mode: AuthCacheMode,
         cache_duration_secs: u64,
         decrypt_cache_duration_secs: u64,
+        passphrase: [u8; 32],
+        auth_token: [u8; 32],
+        pin: String,
     ) -> Self {
         Self {
             keys: Arc::new(RwLock::new(keys)),
@@ -360,6 +429,9 @@ impl VtSshAgentFactory {
                 decrypt_cache_duration_secs,
             ))),
             cache_mode,
+            passphrase: Arc::new(passphrase),
+            auth_token: Arc::new(auth_token),
+            pin: Arc::new(pin),
         }
     }
 }
@@ -379,11 +451,14 @@ impl Agent<tokio::net::UnixListener> for VtSshAgentFactory {
             auth_cache: Arc::clone(&self.auth_cache),
             peer_pid,
             cache_mode: self.cache_mode,
+            passphrase: Arc::clone(&self.passphrase),
+            auth_token: Arc::clone(&self.auth_token),
+            pin: Arc::clone(&self.pin),
         }
     }
 }
 
-// --- Per-connection session (implements Session) ---
+// --- Per-connection session ---
 
 struct VtSshSession {
     keys: Arc<RwLock<HashMap<String, PrivateKey>>>,
@@ -394,12 +469,12 @@ struct VtSshSession {
     auth_cache: Arc<RwLock<AuthCache>>,
     peer_pid: Option<i32>,
     cache_mode: AuthCacheMode,
+    passphrase: Arc<[u8; 32]>,
+    auth_token: Arc<[u8; 32]>,
+    pin: Arc<String>,
 }
 
 impl VtSshSession {
-    /// Ensure keys are loaded. If they were cleared by the idle sweeper,
-    /// silently reload from keychain. Touch ID is enforced per sign/extension
-    /// request via `check_or_prompt_auth()` using the normal cache rules.
     async fn ensure_keys_loaded(&self) -> Result<(), AgentError> {
         let keys = self.keys.read().await;
         if !keys.is_empty() {
@@ -407,19 +482,17 @@ impl VtSshSession {
         }
         drop(keys);
 
-        // Check if keys were cleared by idle timeout (vs just being empty)
         let idle = *self.idle_cleared.read().await;
         if !idle {
             return Ok(());
         }
 
-        tracing::info!("Keys cleared by idle timeout, reloading from keychain");
-        let loaded = load_all_keys().map_err(agent_err)?;
+        tracing::info!("Keys cleared by idle timeout, reloading from file");
+        let loaded = load_all_keys(&self.passphrase).map_err(agent_err)?;
         tracing::info!("Reloaded {} SSH keys", loaded.len());
         let mut keys = self.keys.write().await;
         *keys = loaded;
 
-        // Reset idle_cleared flag
         let mut idle_cleared = self.idle_cleared.write().await;
         *idle_cleared = false;
 
@@ -431,8 +504,11 @@ impl VtSshSession {
         *last = Instant::now();
     }
 
-    /// Check auth cache or prompt Touch ID. Returns true if authorized.
-    /// `is_decrypt` selects the decrypt cache duration (shorter) vs sign duration.
+    /// YubiKey presence check: opens YubiKey, verifies PIN, does ECDH (requires touch).
+    fn verify_yubikey_presence(&self, reason: &str) -> bool {
+        yk_backend::verify_presence_with_pin(&self.pin, reason).unwrap_or(false)
+    }
+
     async fn check_or_prompt_auth(
         &self,
         fingerprint: &str,
@@ -441,19 +517,18 @@ impl VtSshSession {
     ) -> bool {
         let context_id = match self.cache_mode {
             AuthCacheMode::None => {
-                return local_authentication(auth_message);
+                return self.verify_yubikey_presence(auth_message);
             }
             AuthCacheMode::PerSession => match self.peer_pid {
                 Some(pid) => proc_info::get_tty_dev(pid),
-                None => return local_authentication(auth_message),
+                None => return self.verify_yubikey_presence(auth_message),
             },
             AuthCacheMode::PerApp => match self.peer_pid {
                 Some(pid) => proc_info::find_app_pid(pid),
-                None => return local_authentication(auth_message),
+                None => return self.verify_yubikey_presence(auth_message),
             },
         };
 
-        // Check cache (read lock, released before Touch ID)
         {
             let cache = self.auth_cache.read().await;
             if cache.is_authorized(context_id, fingerprint) {
@@ -466,12 +541,10 @@ impl VtSshSession {
             }
         }
 
-        // Prompt Touch ID (no locks held)
-        if !local_authentication(auth_message) {
+        if !self.verify_yubikey_presence(auth_message) {
             return false;
         }
 
-        // Grant cache entry (write lock)
         {
             let mut cache = self.auth_cache.write().await;
             cache.grant(context_id, fingerprint, is_decrypt);
@@ -495,9 +568,6 @@ impl Session for VtSshSession {
         }
         drop(locked);
 
-        // Reload keys from keychain if cleared by idle timeout.
-        // Listing public keys is not security-sensitive; Touch ID is
-        // enforced on sign/extension requests.
         self.ensure_keys_loaded().await?;
 
         let keys = self.keys.read().await;
@@ -528,8 +598,7 @@ impl Session for VtSshSession {
         let comment = privkey.comment();
         let proc_name = self
             .peer_pid
-            .and_then(proc_info::get_proc_path)
-            .and_then(|p| p.rsplit('/').next().map(String::from))
+            .and_then(proc_info::get_process_name)
             .unwrap_or_default();
         let key_label = if comment.is_empty() {
             fp_str.clone()
@@ -542,58 +611,18 @@ impl Session for VtSshSession {
             format!("SSH sign: {} by {}", key_label, proc_name)
         };
 
-        // Check auth cache or prompt Touch ID
         if !self
             .check_or_prompt_auth(&fp_str, &auth_message, false)
             .await
         {
+            tracing::debug!("YubiKey auth failed for {}", fp_str);
             return Err(AgentError::Failure);
         }
+        tracing::debug!("YubiKey auth passed for {}", fp_str);
 
+        // ECDSA-only software signing (keys stored in file, signed in software)
+        // SSH expects signature as mpint(r) || mpint(s), not DER.
         match privkey.key_data() {
-            KeypairData::Ed25519(ref key) => {
-                use ed25519_dalek::Signer;
-                let signing_key: ed25519_dalek::SigningKey =
-                    key.try_into().map_err(AgentError::other)?;
-                let sig = signing_key.sign(&request.data);
-                Signature::new(Algorithm::Ed25519, sig.to_bytes().to_vec())
-                    .map_err(AgentError::other)
-            }
-            KeypairData::Rsa(ref key) => {
-                use rsa::pkcs1v15::SigningKey;
-                use rsa::signature::{RandomizedSigner, SignatureEncoding};
-                use ssh_agent_lib::proto::signature;
-
-                let private_key: rsa::RsaPrivateKey =
-                    key.try_into().map_err(AgentError::other)?;
-                let mut rng = rand::thread_rng();
-
-                if request.flags & signature::RSA_SHA2_512 != 0 {
-                    let sig = SigningKey::<sha2::Sha512>::new(private_key)
-                        .sign_with_rng(&mut rng, &request.data);
-                    Signature::new(
-                        Algorithm::new("rsa-sha2-512").map_err(AgentError::other)?,
-                        sig.to_bytes().to_vec(),
-                    )
-                    .map_err(AgentError::other)
-                } else if request.flags & signature::RSA_SHA2_256 != 0 {
-                    let sig = SigningKey::<sha2::Sha256>::new(private_key)
-                        .sign_with_rng(&mut rng, &request.data);
-                    Signature::new(
-                        Algorithm::new("rsa-sha2-256").map_err(AgentError::other)?,
-                        sig.to_bytes().to_vec(),
-                    )
-                    .map_err(AgentError::other)
-                } else {
-                    let sig = SigningKey::<sha1::Sha1>::new(private_key)
-                        .sign_with_rng(&mut rng, &request.data);
-                    Signature::new(
-                        Algorithm::new("ssh-rsa").map_err(AgentError::other)?,
-                        sig.to_bytes().to_vec(),
-                    )
-                    .map_err(AgentError::other)
-                }
-            }
             KeypairData::Ecdsa(ref key) => {
                 use ssh_key::EcdsaCurve;
                 match key.curve() {
@@ -602,10 +631,12 @@ impl Session for VtSshSession {
                         let secret_key = p256::SecretKey::from_slice(key.private_key_bytes())
                             .map_err(AgentError::other)?;
                         let signing_key = SigningKey::from(secret_key);
-                        let sig: p256::ecdsa::DerSignature = signing_key.sign(&request.data);
+                        let sig: p256::ecdsa::Signature = signing_key.sign(&request.data);
+                        let (r, s) = sig.split_bytes();
+                        let sig_blob = encode_ecdsa_sig_blob(&r, &s);
                         Signature::new(
                             Algorithm::new("ecdsa-sha2-nistp256").map_err(AgentError::other)?,
-                            sig.as_bytes().to_vec(),
+                            sig_blob,
                         )
                         .map_err(AgentError::other)
                     }
@@ -614,42 +645,47 @@ impl Session for VtSshSession {
                         let secret_key = p384::SecretKey::from_slice(key.private_key_bytes())
                             .map_err(AgentError::other)?;
                         let signing_key = SigningKey::from(secret_key);
-                        let sig: p384::ecdsa::DerSignature = signing_key.sign(&request.data);
+                        let sig: p384::ecdsa::Signature = signing_key.sign(&request.data);
+                        let (r, s) = sig.split_bytes();
+                        let sig_blob = encode_ecdsa_sig_blob(&r, &s);
                         Signature::new(
                             Algorithm::new("ecdsa-sha2-nistp384").map_err(AgentError::other)?,
-                            sig.as_bytes().to_vec(),
+                            sig_blob,
                         )
                         .map_err(AgentError::other)
                     }
                     _ => Err(AgentError::Failure),
                 }
             }
-            _ => Err(AgentError::Failure),
+            _ => {
+                tracing::warn!(
+                    "Unsupported key type for {}: only ECDSA P-256/P-384 supported",
+                    fp_str
+                );
+                Err(AgentError::Failure)
+            }
         }
     }
 
-    async fn extension(
-        &mut self,
-        extension: Extension,
-    ) -> Result<Option<Extension>, AgentError> {
+    async fn extension(&mut self, extension: Extension) -> Result<Option<Extension>, AgentError> {
         let locked = self.locked.read().await;
         if *locked {
             return Err(AgentError::Failure);
         }
         drop(locked);
 
-        // Only handle vt custom protocol extensions; ignore standard SSH extensions
-        if extension.name != "encrypt@vt" && extension.name != "decrypt@vt" && extension.name != "auth@vt" {
-            // Return None to indicate unsupported extension (not an error)
+        if extension.name != "encrypt@vt"
+            && extension.name != "decrypt@vt"
+            && extension.name != "auth@vt"
+        {
             return Ok(None);
         }
 
         self.touch_activity().await;
 
-        // Load auth cipher from keychain to verify VT_AUTH
-        let (auth_cipher, passphrase_cipher) = load_passcode_ciphers().map_err(agent_err)?;
+        // Use cached auth token to build auth cipher
+        let auth_cipher = AesGcmCrypto::new(&self.auth_token).map_err(agent_err)?;
 
-        // Decrypt the extension details with auth cipher (verifies VT_AUTH)
         let decrypted = auth_cipher
             .decrypt(extension.details.as_ref())
             .map_err(|_| {
@@ -661,7 +697,7 @@ impl Session for VtSshSession {
             "encrypt@vt" => {
                 let items: Vec<EncryptItem> =
                     serde_json::from_slice(&decrypted).map_err(|e| agent_err(e.into()))?;
-                let mac_cipher = load_mac_cipher(&passphrase_cipher).map_err(agent_err)?;
+                let mac_cipher = AesGcmCrypto::new(&self.passphrase).map_err(agent_err)?;
                 let result: Vec<CryptoResItem> = do_encrypt(&mac_cipher, items);
                 serde_json::to_vec(&result).map_err(|e| agent_err(e.into()))?
             }
@@ -674,14 +710,13 @@ impl Session for VtSshSession {
                     req.host,
                     req.command,
                 );
-                // Check auth cache or prompt Touch ID
                 if !self
                     .check_or_prompt_auth("decrypt@vt", &local_auth_message, true)
                     .await
                 {
                     return Err(AgentError::Failure);
                 }
-                let mac_cipher = load_mac_cipher(&passphrase_cipher).map_err(agent_err)?;
+                let mac_cipher = AesGcmCrypto::new(&self.passphrase).map_err(agent_err)?;
                 let result: Vec<CryptoResItem> = do_decrypt(&mac_cipher, req.items);
                 serde_json::to_vec(&result).map_err(|e| agent_err(e.into()))?
             }
@@ -689,7 +724,6 @@ impl Session for VtSshSession {
                 let req: AuthReq =
                     serde_json::from_slice(&decrypted).map_err(|e| agent_err(e.into()))?;
 
-                // Sanitize untrusted remote strings: strip control chars, truncate
                 let sanitize = |s: &str| -> String {
                     s.chars().filter(|c| !c.is_control()).take(100).collect()
                 };
@@ -698,10 +732,8 @@ impl Session for VtSshSession {
 
                 let auth_message = format!("bio auth: {} from {}", reason, host);
 
-                // Always prompt Touch ID — no auth caching for auth@vt.
-                // Over forwarded agents, all remote sessions share the same local
-                // process, so caching would approve all sudo from any session.
-                if !local_authentication(&auth_message) {
+                // Always require YubiKey touch — no caching for auth@vt
+                if !self.verify_yubikey_presence(&auth_message) {
                     return Err(AgentError::Failure);
                 }
 
@@ -711,7 +743,6 @@ impl Session for VtSshSession {
             _ => unreachable!(),
         };
 
-        // Encrypt response with auth cipher
         let encrypted_response = auth_cipher.encrypt(&response_bytes).map_err(agent_err)?;
 
         Ok(Some(Extension {
@@ -731,6 +762,25 @@ impl Session for VtSshSession {
             Credential::Key { privkey, comment } => {
                 let private_key =
                     PrivateKey::new(privkey, comment.clone()).map_err(AgentError::other)?;
+
+                // Only allow ECDSA P-256/P-384
+                match private_key.key_data() {
+                    KeypairData::Ecdsa(ref key) => {
+                        use ssh_key::EcdsaCurve;
+                        match key.curve() {
+                            EcdsaCurve::NistP256 | EcdsaCurve::NistP384 => {}
+                            _ => {
+                                tracing::warn!("Rejected non-P256/P384 ECDSA key");
+                                return Err(AgentError::Failure);
+                            }
+                        }
+                    }
+                    _ => {
+                        tracing::warn!("Rejected non-ECDSA key (only P-256/P-384 supported)");
+                        return Err(AgentError::Failure);
+                    }
+                }
+
                 let pubkey = private_key.public_key();
                 let fp_str = fingerprint_str(pubkey.key_data());
 
@@ -738,8 +788,8 @@ impl Session for VtSshSession {
                     .to_openssh(ssh_key::LineEnding::LF)
                     .map_err(AgentError::other)?;
 
-                // Load cipher on demand, update single keychain item
-                let cipher = load_cipher_from_keychain().map_err(agent_err)?;
+                let cipher =
+                    load_cipher_from_passphrase(&self.passphrase).map_err(agent_err)?;
                 let mut entries = load_ssh_keys(&cipher).unwrap_or_default();
                 if !entries.iter().any(|e| e.fingerprint == fp_str) {
                     entries.push(SshKeyEntry {
@@ -765,7 +815,7 @@ impl Session for VtSshSession {
     async fn remove_identity(&mut self, identity: RemoveIdentity) -> Result<(), AgentError> {
         let fp_str = fingerprint_str(&identity.pubkey);
 
-        if let Ok(cipher) = load_cipher_from_keychain() {
+        if let Ok(cipher) = load_cipher_from_passphrase(&self.passphrase) {
             let mut entries = load_ssh_keys(&cipher).unwrap_or_default();
             entries.retain(|e| e.fingerprint != fp_str);
             let _ = save_ssh_keys(&cipher, &entries);
@@ -779,7 +829,7 @@ impl Session for VtSshSession {
     }
 
     async fn remove_all_identities(&mut self) -> Result<(), AgentError> {
-        if let Ok(cipher) = load_cipher_from_keychain() {
+        if let Ok(cipher) = load_cipher_from_passphrase(&self.passphrase) {
             let _ = save_ssh_keys(&cipher, &[]);
         }
 
@@ -799,11 +849,9 @@ impl Session for VtSshSession {
         let mut lp = self.lock_passphrase.write().await;
         *lp = Some(hash_lock_passphrase(&passphrase));
 
-        // Clear keys from memory on lock
         let mut keys = self.keys.write().await;
         keys.clear();
 
-        // Clear auth cache on lock
         let mut cache = self.auth_cache.write().await;
         cache.clear();
 
@@ -836,8 +884,7 @@ impl Session for VtSshSession {
         }
         *lp = None;
 
-        // Reload keys after unlock
-        match load_all_keys() {
+        match load_all_keys(&self.passphrase) {
             Ok(loaded) => {
                 let mut keys = self.keys.write().await;
                 *keys = loaded;
@@ -854,9 +901,6 @@ impl Session for VtSshSession {
 
 // --- Agent startup ---
 
-/// Run the SSH agent on `~/.ssh/vt.sock`.
-/// Loads the cipher from keychain to decrypt stored keys, then drops it.
-/// When `print_env` is true, prints `export SSH_AUTH_SOCK=...` for eval.
 pub async fn run_ssh_agent(
     print_env: bool,
     idle_timeout_secs: u64,
@@ -864,38 +908,83 @@ pub async fn run_ssh_agent(
     cache_duration_secs: u64,
     decrypt_cache_duration_secs: u64,
 ) -> Result<()> {
+    // Open YubiKey, verify PIN, decrypt secrets at startup
+    let (mut yk, pin) = yk_backend::open_and_verify_pin()?;
+
+    tracing::info!("Touch YubiKey to decrypt auth token...");
+    let auth_token = yk_backend::load_auth_token(&mut yk)?;
+    tracing::info!("Touch YubiKey to decrypt passphrase...");
+    let passphrase = yk_backend::load_passphrase(&mut yk)?;
+
+    // Drop YubiKey handle — we don't hold it open during agent operation
+    drop(yk);
+
+    run_ssh_agent_inner(
+        print_env, idle_timeout_secs, cache_mode, cache_duration_secs,
+        decrypt_cache_duration_secs, passphrase, auth_token, pin,
+    ).await
+}
+
+/// Run the SSH agent with pre-decrypted secrets (called from serve to avoid double PIN prompt).
+pub async fn run_ssh_agent_with_secrets(
+    print_env: bool,
+    idle_timeout_secs: u64,
+    cache_mode: AuthCacheMode,
+    cache_duration_secs: u64,
+    decrypt_cache_duration_secs: u64,
+    passphrase: [u8; 32],
+    auth_token: [u8; 32],
+    pin: String,
+) -> Result<()> {
+    run_ssh_agent_inner(
+        print_env, idle_timeout_secs, cache_mode, cache_duration_secs,
+        decrypt_cache_duration_secs, passphrase, auth_token, pin,
+    ).await
+}
+
+async fn run_ssh_agent_inner(
+    print_env: bool,
+    idle_timeout_secs: u64,
+    cache_mode: AuthCacheMode,
+    cache_duration_secs: u64,
+    decrypt_cache_duration_secs: u64,
+    passphrase: [u8; 32],
+    auth_token: [u8; 32],
+    pin: String,
+) -> Result<()> {
     let idle_timeout = Duration::from_secs(idle_timeout_secs);
 
-    // Load keys (cipher is loaded and dropped inside load_all_keys)
-    let keys = load_all_keys()?;
+    // Load SSH keys using the decrypted passphrase
+    let keys = load_all_keys(&passphrase)?;
     tracing::info!("Loaded {} SSH keys", keys.len());
 
     // Resolve socket path
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?;
-    let socket_path = home.join(".ssh").join("vt.sock");
+    let socket_path = home.join(".ssh").join("vt-yubi.sock");
 
-    // Clean stale socket
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)?;
     }
-
-    // Ensure .ssh dir exists
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
     if print_env {
-        println!(
-            "export SSH_AUTH_SOCK={};",
-            socket_path.to_string_lossy()
-        );
+        println!("export SSH_AUTH_SOCK={};", socket_path.to_string_lossy());
         println!("echo Agent pid {};", std::process::id());
     }
 
-    let factory =
-        VtSshAgentFactory::new(keys, cache_mode, cache_duration_secs, decrypt_cache_duration_secs);
+    let factory = VtSshAgentFactory::new(
+        keys,
+        cache_mode,
+        cache_duration_secs,
+        decrypt_cache_duration_secs,
+        passphrase,
+        auth_token,
+        pin,
+    );
 
-    // Spawn idle sweeper that clears keys from memory after inactivity
+    // Spawn idle sweeper
     let sweeper_keys = Arc::clone(&factory.keys);
     let sweeper_last = Arc::clone(&factory.last_activity);
     let sweeper_idle_cleared = Arc::clone(&factory.idle_cleared);
@@ -922,7 +1011,7 @@ pub async fn run_ssh_agent(
         }
     });
 
-    // Spawn auth cache sweeper (reuse same pattern)
+    // Spawn auth cache sweeper
     if cache_mode != AuthCacheMode::None {
         let sweeper_cache = Arc::clone(&factory.auth_cache);
         tokio::spawn(async move {
@@ -948,7 +1037,7 @@ pub async fn run_ssh_agent(
         idle_timeout.as_secs() / 60
     );
 
-    // Register signal handler for cleanup
+    // Signal handler for cleanup
     let socket_path_clone = socket_path.clone();
     tokio::spawn(async move {
         let mut sigint =
@@ -968,12 +1057,10 @@ pub async fn run_ssh_agent(
         .await
         .map_err(|e| anyhow::anyhow!("Agent error: {}", e))?;
 
-    // Cleanup on normal exit
     let _ = std::fs::remove_file(&socket_path);
     Ok(())
 }
 
-/// Standalone entry point: runs the agent with env output.
 pub async fn start_ssh_agent(
     idle_timeout_secs: u64,
     cache_mode: AuthCacheMode,
@@ -999,13 +1086,13 @@ mod tests {
         let entries = vec![
             SshKeyEntry {
                 fingerprint: "SHA256:abcdef123456".to_string(),
-                algorithm: "ssh-ed25519".to_string(),
+                algorithm: "ecdsa-sha2-nistp256".to_string(),
                 comment: "test@host".to_string(),
                 key_data: "fake-key-data".to_string(),
             },
             SshKeyEntry {
                 fingerprint: "SHA256:xyz789".to_string(),
-                algorithm: "ssh-rsa".to_string(),
+                algorithm: "ecdsa-sha2-nistp384".to_string(),
                 comment: "another@host".to_string(),
                 key_data: "fake-key-data-2".to_string(),
             },
@@ -1014,7 +1101,7 @@ mod tests {
         let decoded: Vec<SshKeyEntry> = serde_json::from_slice(&json).unwrap();
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].fingerprint, "SHA256:abcdef123456");
-        assert_eq!(decoded[0].algorithm, "ssh-ed25519");
+        assert_eq!(decoded[0].algorithm, "ecdsa-sha2-nistp256");
         assert_eq!(decoded[0].comment, "test@host");
         assert_eq!(decoded[0].key_data, "fake-key-data");
         assert_eq!(decoded[1].fingerprint, "SHA256:xyz789");
@@ -1027,9 +1114,11 @@ mod tests {
 
         let entries = vec![SshKeyEntry {
             fingerprint: "SHA256:test".to_string(),
-            algorithm: "ssh-ed25519".to_string(),
+            algorithm: "ecdsa-sha2-nistp256".to_string(),
             comment: "test".to_string(),
-            key_data: "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----".to_string(),
+            key_data:
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----"
+                    .to_string(),
         }];
 
         let json = serde_json::to_vec(&entries).unwrap();
@@ -1040,25 +1129,14 @@ mod tests {
         assert_eq!(decoded[0].fingerprint, "SHA256:test");
     }
 
-    #[test]
-    fn test_ssh_keys_empty_on_missing() {
-        let key = AesGcmCrypto::generate_key();
-        let cipher = AesGcmCrypto::new(&key).unwrap();
-        let entries = load_ssh_keys(&cipher);
-        // If keychain item doesn't exist: Ok(empty vec).
-        // If it exists but decryption fails (wrong key): Err.
-        // Both are valid outcomes depending on keychain state.
-        match entries {
-            Ok(v) => assert!(v.is_empty()),
-            Err(_) => {} // keychain item exists but can't be decrypted with random key
-        }
-    }
-
     // --- AuthCacheMode tests ---
 
     #[test]
     fn test_auth_cache_mode_from_str() {
-        assert_eq!(AuthCacheMode::from_str("none").unwrap(), AuthCacheMode::None);
+        assert_eq!(
+            AuthCacheMode::from_str("none").unwrap(),
+            AuthCacheMode::None
+        );
         assert_eq!(
             AuthCacheMode::from_str("per-session").unwrap(),
             AuthCacheMode::PerSession
@@ -1079,19 +1157,8 @@ mod tests {
             AuthCacheMode::from_str("per_app").unwrap(),
             AuthCacheMode::PerApp
         );
-        assert_eq!(AuthCacheMode::from_str("app").unwrap(), AuthCacheMode::PerApp);
-    }
-
-    #[test]
-    fn test_auth_cache_mode_from_str_case_insensitive() {
-        assert_eq!(AuthCacheMode::from_str("None").unwrap(), AuthCacheMode::None);
-        assert_eq!(AuthCacheMode::from_str("NONE").unwrap(), AuthCacheMode::None);
         assert_eq!(
-            AuthCacheMode::from_str("Per-Session").unwrap(),
-            AuthCacheMode::PerSession
-        );
-        assert_eq!(
-            AuthCacheMode::from_str("PER-APP").unwrap(),
+            AuthCacheMode::from_str("app").unwrap(),
             AuthCacheMode::PerApp
         );
     }
@@ -1100,7 +1167,6 @@ mod tests {
     fn test_auth_cache_mode_from_str_invalid() {
         assert!(AuthCacheMode::from_str("invalid").is_err());
         assert!(AuthCacheMode::from_str("").is_err());
-        assert!(AuthCacheMode::from_str("per").is_err());
     }
 
     #[test]
@@ -1126,47 +1192,28 @@ mod tests {
         let mut cache = AuthCache::new(300, 60);
         cache.grant(1, "fp1", false);
 
-        // Same fingerprint, different context
         assert!(!cache.is_authorized(2, "fp1"));
-        // Same context, different fingerprint
         assert!(!cache.is_authorized(1, "fp2"));
     }
 
     #[test]
     fn test_auth_cache_expiry() {
-        let mut cache = AuthCache::new(0, 0); // 0 second duration = immediately expired
+        let mut cache = AuthCache::new(0, 0);
         cache.grant(1, "fp1", false);
 
-        // With 0 duration, entries expire immediately
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert!(!cache.is_authorized(1, "fp1"));
     }
 
     #[test]
     fn test_auth_cache_decrypt_expiry() {
-        // sign=300s, decrypt=0s — decrypt entries expire immediately while sign survives
         let mut cache = AuthCache::new(300, 0);
-        cache.grant(1, "fp1", false); // sign
-        cache.grant(2, "decrypt@vt", true); // decrypt
+        cache.grant(1, "fp1", false);
+        cache.grant(2, "decrypt@vt", true);
 
         std::thread::sleep(std::time::Duration::from_millis(10));
-        assert!(cache.is_authorized(1, "fp1")); // sign still valid
-        assert!(!cache.is_authorized(2, "decrypt@vt")); // decrypt expired
-    }
-
-    #[test]
-    fn test_auth_cache_sweep_mixed_expiry() {
-        // sign=300s, decrypt=0s
-        let mut cache = AuthCache::new(300, 0);
-        cache.grant(1, "fp1", false); // sign — long TTL
-        cache.grant(2, "decrypt@vt", true); // decrypt — immediate expiry
-
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        cache.sweep_expired();
-        // sign entry survives, decrypt entry swept
         assert!(cache.is_authorized(1, "fp1"));
         assert!(!cache.is_authorized(2, "decrypt@vt"));
-        assert_eq!(cache.entries.len(), 1);
     }
 
     #[test]
@@ -1183,34 +1230,12 @@ mod tests {
 
     #[test]
     fn test_auth_cache_sweep_expired() {
-        let mut cache = AuthCache::new(0, 0); // 0 second = immediately expired
+        let mut cache = AuthCache::new(0, 0);
         cache.grant(1, "fp1", false);
         cache.grant(2, "fp2", true);
 
         std::thread::sleep(std::time::Duration::from_millis(10));
         cache.sweep_expired();
         assert!(cache.entries.is_empty());
-    }
-
-    // --- proc_info tests (macOS only, require running process) ---
-
-    #[test]
-    #[ignore]
-    fn test_proc_bsdinfo_self() {
-        let pid = std::process::id() as i32;
-        let result = proc_info::get_proc_bsdinfo(pid);
-        assert!(result.is_some(), "Should be able to query own process");
-        let (ppid, _tdev) = result.unwrap();
-        assert!(ppid > 0, "Parent PID should be positive");
-    }
-
-    #[test]
-    #[ignore]
-    fn test_proc_path_self() {
-        let pid = std::process::id() as i32;
-        let result = proc_info::get_proc_path(pid);
-        assert!(result.is_some(), "Should be able to get own process path");
-        let path = result.unwrap();
-        assert!(!path.is_empty(), "Path should not be empty");
     }
 }

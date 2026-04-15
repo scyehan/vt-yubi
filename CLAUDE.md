@@ -10,7 +10,12 @@ cargo build                  # Debug build
 cargo test                   # Run non-ignored tests (pure crypto tests, no server needed)
 cargo test test_name         # Run a specific test
 cargo test -- --ignored      # Run ALL tests (requires running server + macOS keychain)
+cargo clippy                 # Lint
+cargo fmt                    # Format
+cargo fmt -- --check         # Check formatting without modifying
 ```
+
+Tests marked `#[ignore]` require either a running `vt serve` instance or macOS keychain access (security.rs: keychain ops, serve.rs: HTTP endpoint, ssh_agent.rs: key storage/signing). Non-ignored tests are pure crypto unit tests that run anywhere.
 
 ## Architecture
 
@@ -25,6 +30,11 @@ VT (Vault) is a macOS-based KMS using the system keychain for secret storage and
 - **security.rs** — `AesGcmCrypto` wrapper (AES-256-GCM with 12-byte nonce prepended to ciphertext). Keychain access via `security-framework` crate (`set_keychain`, `get_keychain`, `delete_keychain`), local auth via `localauthentication-rs`.
 - **ssh_agent.rs** — SSH agent implementation using `ssh-agent-lib`. Split into `VtSshAgentFactory` (implements `Agent<UnixListener>`, owns shared state) and `VtSshSession` (per-connection, implements `Session`). Includes `AuthCacheMode`/`AuthCache` for optional per-session or per-app Touch ID caching, and a `proc_info` module for macOS process introspection (`proc_pidinfo`/`proc_pidpath`). Keys stored in keychain as `rusty.vault.ssh_keys` (single encrypted JSON blob). Touch ID required for `sign()` and `decrypt@vt` (with optional caching). Non-vt extensions (e.g. `session-bind@openssh.com`) are passed through gracefully. Touch ID prompt includes the calling process name. Supports Ed25519, RSA, ECDSA P-256/P-384. Lock passphrase is SHA-256 hashed (never stored in plaintext) and compared with constant-time equality (`subtle`); stored hash is zeroized on unlock. Lock also clears keys from memory; unlock reloads them from keychain.
 - **ssh_cli.rs** — CLI functions for SSH key management: `ssh_add` (parse key from file or stdin with interactive comment prompt, encrypt, store), `ssh_list` (read index), `ssh_remove`/`ssh_remove_all` (delete from keychain + index), `ssh_show` (display public key).
+
+### Supporting Files
+
+- **Vagrantfile** — Ubuntu VM for testing PAM/sudo integration with `vt auth` over SSH agent forwarding.
+- **setup-pam.sh** — Automated setup script for remote Linux `vt auth` PAM configuration (creates helper script, edits `/etc/pam.d/sudo`).
 
 ### Keychain Access
 

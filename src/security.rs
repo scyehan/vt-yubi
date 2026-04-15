@@ -6,135 +6,26 @@ use anyhow::{ensure, Result};
 use base64::{prelude::BASE64_URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use std::env;
 
-pub fn set_keychain(name: &str, _value: &[u8]) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        use security_framework::passwords::set_generic_password;
-        let service = "rusty.vault.".to_string() + name;
-        set_generic_password(&service, &"prod".to_string(), &_value)?;
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = name;
-        anyhow::bail!("keychain is only supported on macOS");
-    }
-    #[cfg(target_os = "macos")]
-    Ok(())
-}
-
-pub fn get_keychain(name: &str) -> Result<Vec<u8>> {
-    #[cfg(target_os = "macos")]
-    {
-        use security_framework::passwords::get_generic_password;
-        let service = "rusty.vault.".to_string() + name;
-        get_generic_password(&service, &"prod".to_string())
-            .map_err(|e| anyhow::anyhow!("Failed to get keychain {}: {}", name, e))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = name;
-        anyhow::bail!("keychain is only supported on macOS");
-    }
-}
-
+#[cfg(feature = "server")]
 #[allow(dead_code)]
-pub fn delete_keychain(name: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        use security_framework::passwords::delete_generic_password;
-        let service = "rusty.vault.".to_string() + name;
-        delete_generic_password(&service, &"prod".to_string())
-            .map_err(|e| anyhow::anyhow!("Failed to delete keychain {}: {}", name, e))?;
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = name;
-        anyhow::bail!("keychain is only supported on macOS");
-    }
-    #[cfg(target_os = "macos")]
-    Ok(())
+pub fn load_mac_cipher_from_yubikey(yk: &mut ::yubikey::YubiKey) -> Result<AesGcmCrypto> {
+    let passphrase = crate::yk_backend::load_passphrase(yk)?;
+    AesGcmCrypto::new(&passphrase)
 }
 
-pub fn local_authentication(reason: &str) -> bool {
-    #[cfg(not(target_os = "macos"))]
-    {
-        tracing::warn!("local authentication is not supported on this platform");
-        return false;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        use localauthentication_rs::{LAPolicy, LocalAuthentication};
-        let local_authentication = LocalAuthentication::new();
-        local_authentication.evaluate_policy(LAPolicy::DeviceOwnerAuthentication, reason)
-    }
-}
-
-pub fn derive_passphrase_secret(passcode: &[u8; 32], bin_path: Option<&str>) -> Result<[u8; 32]> {
-    let passcode = BASE64_URL_SAFE_NO_PAD.encode(&passcode);
-    let bin_path = bin_path
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| env::current_exe().unwrap().to_string_lossy().to_string());
-    let derived_str = format!("{}:{}:{}", passcode, env::var("USER")?, bin_path,);
-    let hash = Sha256::digest(&Sha256::digest(derived_str.as_bytes()));
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&hash[..32]);
-    Ok(key)
-}
-
-pub fn create_and_save_passcode_passphrase(
-    real_passphrase: &[u8; 32],
-    bin_path: Option<&str>,
-) -> Result<()> {
-    let origin_auth_token = AesGcmCrypto::generate_key();
-    let hash = Sha256::digest(&Sha256::digest(origin_auth_token));
-    let mut auth_token = [0u8; 32];
-    auth_token.copy_from_slice(&hash[..32]);
-
-    let passcode = AesGcmCrypto::generate_key();
-    let mut passcode_and_auth_token = Vec::with_capacity(passcode.len() + auth_token.len());
-    passcode_and_auth_token.extend_from_slice(&passcode);
-    passcode_and_auth_token.extend_from_slice(&auth_token);
-
-    set_keychain("passcode", &passcode_and_auth_token).expect("set keychain passcode");
-    tracing::info!("passcode set!");
-
-    let passphrase_secret = derive_passphrase_secret(&passcode, bin_path)?;
-    let aes = AesGcmCrypto::new(&passphrase_secret)?;
-    // let real_passphrase = AesGcmCrypto::generate_key();
-    let encrypted_passphrase = aes.encrypt(real_passphrase)?;
-
-    set_keychain("passphrase", &encrypted_passphrase).expect("set keychain passphrase");
-    tracing::info!("passphrase set!");
-
-    tracing::info!(
-        "export VT_AUTH={};",
-        BASE64_URL_SAFE_NO_PAD.encode(origin_auth_token)
-    );
-    Ok(())
-}
-
-pub fn load_mac_cipher(passphrase_cipher: &AesGcmCrypto) -> Result<AesGcmCrypto> {
-    let encrypted_passphrase = get_keychain("passphrase")?;
-    let decrypted_passphrase = passphrase_cipher.decrypt(&encrypted_passphrase)?;
-    AesGcmCrypto::new(decrypted_passphrase.as_slice().try_into()?)
-}
-
-// Return auth_token, auth_cipher, passphrase_cipher
-pub fn load_passcode_ciphers() -> Result<(AesGcmCrypto, AesGcmCrypto)> {
-    let passcode = get_keychain("passcode")?;
-    ensure!(
-        passcode.len() == 64,
-        "Passcode length is {}, expected 64",
-        passcode.len()
-    );
-    let passcode_arr: [u8; 32] = passcode[..32].try_into()?;
-    let auth_token: [u8; 32] = passcode[32..].try_into()?;
-
-    let passphrase_secret = derive_passphrase_secret(&passcode_arr, None)?;
-    let passphrase_cipher = AesGcmCrypto::new(&passphrase_secret)?;
+#[cfg(feature = "server")]
+#[allow(dead_code)]
+pub fn load_ciphers_from_yubikey(
+    yk: &mut ::yubikey::YubiKey,
+) -> Result<(AesGcmCrypto, AesGcmCrypto)> {
+    tracing::info!("Touch YubiKey to decrypt auth token...");
+    let auth_token = crate::yk_backend::load_auth_token(yk)?;
     let auth_cipher = AesGcmCrypto::new(&auth_token)?;
+
+    tracing::info!("Touch YubiKey to decrypt passphrase...");
+    let passphrase = crate::yk_backend::load_passphrase(yk)?;
+    let passphrase_cipher = AesGcmCrypto::new(&passphrase)?;
 
     Ok((auth_cipher, passphrase_cipher))
 }
@@ -204,21 +95,11 @@ impl AesGcmCrypto {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tracing_test::traced_test;
 
     #[test]
     fn test_base64_encode() {
         let text = b"to be encoded".to_vec();
         assert_eq!(BASE64_URL_SAFE_NO_PAD.encode(&text), "dG8gYmUgZW5jb2RlZA");
-    }
-
-    #[traced_test]
-    #[test]
-    #[ignore]
-    fn test_create_and_save_passcode_passphrase() {
-        let real_passphrase = AesGcmCrypto::generate_key();
-        let result = create_and_save_passcode_passphrase(&real_passphrase, None);
-        assert!(result.is_ok())
     }
 
     #[test]
@@ -229,7 +110,6 @@ mod tests {
         assert_eq!(key2.len(), 32);
         assert_ne!(key1, key2);
 
-        // test nonce generation
         let nonce1 = AesGcmCrypto::generate_nonce();
         let nonce2 = AesGcmCrypto::generate_nonce();
         assert_eq!(nonce1.len(), 12);
@@ -311,28 +191,12 @@ mod tests {
         let key = AesGcmCrypto::generate_key();
         let crypto = AesGcmCrypto::new(&key).unwrap();
 
-        let plaintext = "Hello, 世界! 🌍".as_bytes();
+        let plaintext = "Hello, \u{4e16}\u{754c}! \u{1f30d}".as_bytes();
         let encrypted = crypto.encrypt(plaintext).unwrap();
         let decrypted = crypto.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted, plaintext);
 
         let decrypted_str = String::from_utf8(decrypted).unwrap();
-        assert_eq!(decrypted_str, "Hello, 世界! 🌍");
-    }
-
-    #[test]
-    #[ignore]
-    fn test_encrypt_body() {
-        let body = r#"{"items":[]}"#.to_string();
-        let (cipher, _) = load_passcode_ciphers().expect("load auth cipher");
-        let encrypted = cipher.encrypt(body.as_bytes()).expect("encrypt body");
-        let decrypted = cipher.decrypt(&encrypted).expect("decrypt body");
-        assert_eq!(decrypted, body.as_bytes());
-    }
-
-    #[test]
-    #[ignore]
-    fn test_biometric_authentication() {
-        assert!(local_authentication(&"test biometric authentication"));
+        assert_eq!(decrypted_str, "Hello, \u{4e16}\u{754c}! \u{1f30d}");
     }
 }

@@ -1,5 +1,6 @@
 use crate::core::{do_decrypt, do_encrypt, DecryptReq, EncryptItem};
-use crate::security::{load_mac_cipher, load_passcode_ciphers, local_authentication, AesGcmCrypto};
+use crate::security::AesGcmCrypto;
+use crate::yk_backend;
 
 use anyhow::Result;
 use axum::{
@@ -16,7 +17,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, warn};
 
-/// Maximum request/response body size (1 MB).
 const MAX_BODY_SIZE: usize = 1024 * 1024;
 
 fn create_auth_middleware(
@@ -48,18 +48,14 @@ async fn auth_middleware_impl(
                             .replace_all(s, r#""plaintext":"****""#)
                             .to_string();
                         info!("request body: {}", modified_s)
-                    },
+                    }
                     Err(_) => info!("Decrypted request body: <non-UTF8 data>"),
                 }
                 Request::from_parts(parts, Body::from(decrypted_bytes))
             }
-            Err(_) => {
-                return (StatusCode::FORBIDDEN, "Request failed").into_response()
-            }
+            Err(_) => return (StatusCode::FORBIDDEN, "Request failed").into_response(),
         },
-        Err(_) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Request failed").into_response()
-        }
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Request failed").into_response(),
     };
 
     let response = next.run(decrypted_req).await;
@@ -136,7 +132,8 @@ async fn log_middleware(request: Request, next: Next) -> Response {
 
 #[derive(Clone)]
 struct AppState {
-    passphrase_cipher: Arc<AesGcmCrypto>,
+    passphrase: Arc<[u8; 32]>,
+    pin: Arc<String>,
 }
 
 pub async fn serve(
@@ -147,17 +144,32 @@ pub async fn serve(
     auth_cache_duration: u64,
     decrypt_cache_duration: u64,
 ) -> Result<()> {
-    let (auth_cipher, passphrase_cipher) =
-        load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
+    // Open YubiKey, verify PIN, decrypt secrets at startup
+    let (mut yk, pin) = yk_backend::open_and_verify_pin()?;
 
-    // Start SSH agent
+    tracing::info!("Touch YubiKey to decrypt auth token...");
+    let auth_token = yk_backend::load_auth_token(&mut yk)?;
+
+    tracing::info!("Touch YubiKey to decrypt passphrase...");
+    let passphrase = yk_backend::load_passphrase(&mut yk)?;
+
+    // Drop YubiKey handle
+    drop(yk);
+
+    let auth_cipher = AesGcmCrypto::new(&auth_token)?;
+
+    // Start SSH agent — share PIN + decrypted secrets so it doesn't re-prompt
+    let ssh_pin = pin.clone();
     let ssh_handle = tokio::spawn(async move {
-        if let Err(e) = crate::ssh_agent::run_ssh_agent(
+        if let Err(e) = crate::ssh_agent::run_ssh_agent_with_secrets(
             false,
             ssh_idle_timeout,
             auth_cache_mode,
             auth_cache_duration,
             decrypt_cache_duration,
+            passphrase,
+            auth_token,
+            ssh_pin,
         )
         .await
         {
@@ -173,7 +185,8 @@ pub async fn serve(
             .route("/decrypt", post(handler_decrypt))
             .route("/encrypt", post(handler_encrypt))
             .with_state(AppState {
-                passphrase_cipher: Arc::new(passphrase_cipher),
+                passphrase: Arc::new(passphrase),
+                pin: Arc::new(pin),
             })
             .layer(middleware::from_fn(create_auth_middleware(Arc::new(
                 auth_cipher,
@@ -201,17 +214,19 @@ async fn handler_decrypt(
         payload.host,
         payload.command,
     );
-    if !local_authentication(&local_auth_message) {
+
+    // YubiKey presence check for HTTP decrypt (uses cached PIN)
+    if !yk_backend::verify_presence_with_pin(&state.pin, &local_auth_message).unwrap_or(false) {
         return (StatusCode::FORBIDDEN, "User Rejected").into_response();
     }
-    if let Ok(cipher) = load_mac_cipher(&state.passphrase_cipher) {
-        Json(do_decrypt(&cipher, payload.items)).into_response()
-    } else {
-        return (
+
+    match AesGcmCrypto::new(&state.passphrase) {
+        Ok(cipher) => Json(do_decrypt(&cipher, payload.items)).into_response(),
+        Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to load passphrase cipher",
         )
-            .into_response();
+            .into_response(),
     }
 }
 
@@ -219,21 +234,12 @@ async fn handler_encrypt(
     State(state): State<AppState>,
     Json(payload): Json<Vec<EncryptItem>>,
 ) -> impl IntoResponse {
-    if let Ok(cipher) = load_mac_cipher(&state.passphrase_cipher) {
-        Json(do_encrypt(&cipher, payload)).into_response()
-    } else {
-        return (
+    match AesGcmCrypto::new(&state.passphrase) {
+        Ok(cipher) => Json(do_encrypt(&cipher, payload)).into_response(),
+        Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to load passphrase cipher",
         )
-            .into_response();
+            .into_response(),
     }
-}
-
-#[cfg(test)]
-mod tests {
-
-    #[test]
-    #[ignore]
-    fn test_encrypt_decrypt() {}
 }

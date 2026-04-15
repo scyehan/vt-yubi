@@ -2,17 +2,23 @@ use anyhow::{Context, Result};
 use ssh_key::private::PrivateKey;
 use ssh_key::HashAlg;
 
-use crate::security::{load_mac_cipher, load_passcode_ciphers, local_authentication};
+use crate::security::AesGcmCrypto;
 use crate::ssh_agent::{load_ssh_keys, save_ssh_keys, SshKeyEntry};
+use crate::yk_backend;
+
+/// Open YubiKey, verify PIN, verify presence (touch), decrypt passphrase, return cipher.
+/// Combines PIN + touch + passphrase decrypt in a single YubiKey session.
+fn open_and_load_cipher(reason: &str) -> Result<AesGcmCrypto> {
+    let (mut yk, _pin) = yk_backend::open_and_verify_pin()?;
+    // Presence verification via passphrase decrypt (requires touch due to TouchPolicy::Always).
+    // This serves as both the touch gate AND loads the cipher — no separate verify_presence needed.
+    tracing::info!("Touch YubiKey to confirm: {}", reason);
+    let passphrase = yk_backend::load_passphrase(&mut yk)?;
+    AesGcmCrypto::new(&passphrase)
+}
 
 pub fn ssh_add(file: Option<String>, comment: Option<String>) -> Result<()> {
-    if !local_authentication("add SSH key") {
-        return Err(anyhow::anyhow!("Authentication failed"));
-    }
-
-    let (_, passphrase_cipher) =
-        load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
-    let mac_cipher = load_mac_cipher(&passphrase_cipher)?;
+    let mac_cipher = open_and_load_cipher("add SSH key")?;
 
     let interactive = file.is_none();
     let key_data = match file {
@@ -28,8 +34,8 @@ pub fn ssh_add(file: Option<String>, comment: Option<String>) -> Result<()> {
         }
     };
 
-    let mut privkey = PrivateKey::from_openssh(key_data.as_bytes())
-        .context("Failed to parse SSH private key")?;
+    let mut privkey =
+        PrivateKey::from_openssh(key_data.as_bytes()).context("Failed to parse SSH private key")?;
 
     // If encrypted, prompt for passphrase
     if privkey.is_encrypted() {
@@ -40,9 +46,30 @@ pub fn ssh_add(file: Option<String>, comment: Option<String>) -> Result<()> {
             .context("Failed to decrypt key (wrong passphrase?)")?;
     }
 
+    // Only allow ECDSA P-256/P-384
+    match privkey.key_data() {
+        ssh_key::private::KeypairData::Ecdsa(ref key) => {
+            use ssh_key::EcdsaCurve;
+            match key.curve() {
+                EcdsaCurve::NistP256 | EcdsaCurve::NistP384 => {}
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "Only ECDSA P-256 and P-384 keys are supported. Got: {:?}",
+                        key.curve()
+                    ));
+                }
+            }
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "Only ECDSA P-256 and P-384 keys are supported. Got: {}",
+                privkey.algorithm()
+            ));
+        }
+    }
+
     let comment = comment.unwrap_or_else(|| {
         if interactive {
-            // stdin is EOF after Ctrl+D, read from /dev/tty instead
             if let Ok(mut tty) = std::fs::File::open("/dev/tty") {
                 use std::io::BufRead;
                 eprint!("Comment (leave empty to use key's default): ");
@@ -61,7 +88,6 @@ pub fn ssh_add(file: Option<String>, comment: Option<String>) -> Result<()> {
         privkey.comment().to_string()
     });
 
-    // Rebuild key with the desired comment so it's embedded in the stored OpenSSH format
     let privkey = PrivateKey::new(privkey.key_data().clone(), &comment)
         .context("Failed to set comment on key")?;
 
@@ -74,7 +100,6 @@ pub fn ssh_add(file: Option<String>, comment: Option<String>) -> Result<()> {
         .to_openssh(ssh_key::LineEnding::LF)
         .context("Failed to serialize key")?;
 
-    // Load all keys, add the new one, save back as single item
     let mut entries = load_ssh_keys(&mac_cipher)?;
     if !entries.iter().any(|e| e.fingerprint == fp_str) {
         entries.push(SshKeyEntry {
@@ -91,9 +116,7 @@ pub fn ssh_add(file: Option<String>, comment: Option<String>) -> Result<()> {
 }
 
 pub fn ssh_list() -> Result<()> {
-    let (_, passphrase_cipher) =
-        load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
-    let mac_cipher = load_mac_cipher(&passphrase_cipher)?;
+    let mac_cipher = open_and_load_cipher("list SSH keys")?;
 
     let entries = load_ssh_keys(&mac_cipher)?;
     if entries.is_empty() {
@@ -115,13 +138,7 @@ pub fn ssh_list() -> Result<()> {
 }
 
 pub fn ssh_remove(fingerprint: &str) -> Result<()> {
-    if !local_authentication("remove SSH key") {
-        return Err(anyhow::anyhow!("Authentication failed"));
-    }
-
-    let (_, passphrase_cipher) =
-        load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
-    let mac_cipher = load_mac_cipher(&passphrase_cipher)?;
+    let mac_cipher = open_and_load_cipher("remove SSH key")?;
 
     let mut entries = load_ssh_keys(&mac_cipher)?;
 
@@ -158,14 +175,7 @@ pub fn ssh_remove(fingerprint: &str) -> Result<()> {
 }
 
 pub fn ssh_remove_all() -> Result<()> {
-    if !local_authentication("remove all SSH keys") {
-        return Err(anyhow::anyhow!("Authentication failed"));
-    }
-
-    let (_, passphrase_cipher) =
-        load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
-    let mac_cipher = load_mac_cipher(&passphrase_cipher)?;
-
+    let mac_cipher = open_and_load_cipher("remove all SSH keys")?;
     save_ssh_keys(&mac_cipher, &[])?;
 
     println!("Removed all SSH keys.");
@@ -173,13 +183,7 @@ pub fn ssh_remove_all() -> Result<()> {
 }
 
 pub fn ssh_comment(fingerprint: &str, comment: &str) -> Result<()> {
-    if !local_authentication("change SSH key comment") {
-        return Err(anyhow::anyhow!("Authentication failed"));
-    }
-
-    let (_, passphrase_cipher) =
-        load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
-    let mac_cipher = load_mac_cipher(&passphrase_cipher)?;
+    let mac_cipher = open_and_load_cipher("change SSH key comment")?;
 
     let mut entries = load_ssh_keys(&mac_cipher)?;
 
@@ -205,7 +209,6 @@ pub fn ssh_comment(fingerprint: &str, comment: &str) -> Result<()> {
     let algorithm = matches[0].algorithm.clone();
     let entry = entries.iter_mut().find(|e| e.fingerprint == fp).unwrap();
 
-    // Update comment in the stored OpenSSH key data
     let privkey = PrivateKey::from_openssh(entry.key_data.as_bytes())
         .context("Failed to parse stored key")?;
     let privkey = PrivateKey::new(privkey.key_data().clone(), comment)
@@ -223,13 +226,7 @@ pub fn ssh_comment(fingerprint: &str, comment: &str) -> Result<()> {
 }
 
 pub fn ssh_show(fingerprint: &str) -> Result<()> {
-    if !local_authentication("show SSH public key") {
-        return Err(anyhow::anyhow!("Authentication failed"));
-    }
-
-    let (_, passphrase_cipher) =
-        load_passcode_ciphers().map_err(|e| anyhow::anyhow!("Not initialized? {}", e))?;
-    let mac_cipher = load_mac_cipher(&passphrase_cipher)?;
+    let mac_cipher = open_and_load_cipher("show SSH public key")?;
 
     let entries = load_ssh_keys(&mac_cipher)?;
 

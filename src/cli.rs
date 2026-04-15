@@ -1,28 +1,25 @@
 use std::{env, vec};
 
-use crate::security::{
-    create_and_save_passcode_passphrase, decode_auth_cipher_from_b64, get_keychain,
-    load_passcode_ciphers, local_authentication, AesGcmCrypto,
-};
 use crate::core::{AuthReq, AuthRes, CryptoResItem, DecryptReq, EncryptItem, SecretType};
+use crate::security::{decode_auth_cipher_from_b64, AesGcmCrypto};
 use anyhow::{ensure, Context, Result};
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use base64::Engine;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ssh_agent_lib::proto::{Extension, Unparsed};
-use std::io::{self, Write};
+use std::io::{self, Read as _, Write};
 use tracing::debug;
 
-pub fn init() -> Result<()> {
-    let passphrase_result = load_passcode_ciphers();
-    if passphrase_result.is_ok() {
-        Err(anyhow::anyhow!(
-            "Error: already initialized? Please delete keys in keychain of 'rusty.vault' first"
-        ))?;
-        std::process::exit(1);
-    }
-    create_and_save_passcode_passphrase(&AesGcmCrypto::generate_key(), None)?;
+#[cfg(feature = "server")]
+pub fn init(pubkey: Option<String>) -> Result<()> {
+    let vt_auth = match pubkey {
+        Some(path) => crate::yk_backend::yubikey_init_with_pubkey(&path)?,
+        None => crate::yk_backend::yubikey_init()?,
+    };
+    println!("\nInitialization complete!");
+    println!("Export this token to use vt-yubi:");
+    println!("  export VT_AUTH={}", vt_auth);
     Ok(())
 }
 
@@ -78,7 +75,6 @@ impl VTClient {
                 serde_json::from_slice(&decrypted_body).context("Failed to parse response body")?;
             Ok(res_body)
         } else {
-            // Post-auth errors are encrypted; pre-auth errors are plaintext
             let res_str = match cipher.decrypt(&res_bytes) {
                 Ok(decrypted) => String::from_utf8_lossy(&decrypted).into_owned(),
                 Err(_) => String::from_utf8_lossy(&res_bytes).into_owned(),
@@ -87,17 +83,20 @@ impl VTClient {
         }
     }
 
-    /// Try to send an extension request via the SSH agent socket.
-    /// Returns Ok(Some(bytes)) on success, Ok(None) if socket not available, Err on auth/agent errors.
     #[cfg(unix)]
-    fn try_agent_extension(auth_token: &str, name: &str, payload: &[u8]) -> Result<Option<Vec<u8>>> {
+    fn try_agent_extension(
+        auth_token: &str,
+        name: &str,
+        payload: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
         use std::os::unix::net::UnixStream;
 
         let socket_path = if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
             std::path::PathBuf::from(sock)
         } else {
-            let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?;
-            home.join(".ssh").join("vt.sock")
+            let home =
+                dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?;
+            home.join(".ssh").join("vt-yubi.sock")
         };
 
         let stream = match UnixStream::connect(&socket_path) {
@@ -117,7 +116,9 @@ impl VTClient {
         };
 
         let mut client = ssh_agent_lib::blocking::Client::new(stream);
-        let response = client.extension(ext).map_err(|e| anyhow::anyhow!("{}", e))?;
+        let response = client
+            .extension(ext)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         match response {
             Some(resp) => {
@@ -133,13 +134,20 @@ impl VTClient {
         {
             let payload = serde_json::to_vec(items)?;
             let auth_token = self.auth_token.clone();
-            let result =
-                tokio::task::spawn_blocking(move || Self::try_agent_extension(&auth_token, "encrypt@vt", &payload))
-                    .await??;
+            let result = tokio::task::spawn_blocking(move || {
+                Self::try_agent_extension(&auth_token, "encrypt@vt", &payload)
+            })
+            .await??;
             match result {
                 Some(bytes) => return Ok(serde_json::from_slice(&bytes)?),
-                None if self.base_url.is_some() => debug!("Agent socket not available, falling back to HTTP"),
-                None => return Err(anyhow::anyhow!("SSH agent socket not available and VT_ADDR not set")),
+                None if self.base_url.is_some() => {
+                    debug!("Agent socket not available, falling back to HTTP")
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "SSH agent socket not available and VT_ADDR not set"
+                    ))
+                }
             }
         }
         self.authed_request("/encrypt", &items).await
@@ -150,13 +158,20 @@ impl VTClient {
         {
             let payload = serde_json::to_vec(req)?;
             let auth_token = self.auth_token.clone();
-            let result =
-                tokio::task::spawn_blocking(move || Self::try_agent_extension(&auth_token, "decrypt@vt", &payload))
-                    .await??;
+            let result = tokio::task::spawn_blocking(move || {
+                Self::try_agent_extension(&auth_token, "decrypt@vt", &payload)
+            })
+            .await??;
             match result {
                 Some(bytes) => return Ok(serde_json::from_slice(&bytes)?),
-                None if self.base_url.is_some() => debug!("Agent socket not available, falling back to HTTP"),
-                None => return Err(anyhow::anyhow!("SSH agent socket not available and VT_ADDR not set")),
+                None if self.base_url.is_some() => {
+                    debug!("Agent socket not available, falling back to HTTP")
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "SSH agent socket not available and VT_ADDR not set"
+                    ))
+                }
             }
         }
         self.authed_request("/decrypt", req).await
@@ -184,7 +199,7 @@ impl VTClient {
                 }
                 None => {
                     return Err(anyhow::anyhow!(
-                        "SSH agent not available — need agent forwarding or ~/.ssh/vt.sock"
+                        "SSH agent not available — need agent forwarding or ~/.ssh/vt-yubi.sock"
                     ));
                 }
             }
@@ -212,21 +227,99 @@ fn prompt_input_password(prompt_before: &str, prompt_after: &str) -> Result<Stri
     Ok(secret.to_string())
 }
 
-pub async fn create(vt_client: VTClient) -> Result<()> {
-    print!("Enter secret type (raw/totp) [default: raw]: ");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    if input.trim().is_empty() {
-        input = "raw".to_string();
-    }
-    debug!("User input for secret type: '{}'", input);
-    let secret_type = SecretType::from_str(&input.trim().to_lowercase());
-    if secret_type == SecretType::UNKNOWN {
-        return Err(anyhow::anyhow!("Invalid secret type: {}", input));
-    }
+#[derive(Serialize, Deserialize, Debug)]
+struct SecretEntry {
+    description: String,
+    vt: String,
+    secret_type: String,
+    created_at: String,
+}
 
-    let secret = prompt_input_password("Enter secret: ", "Secret entered: ")?;
+fn vt_yubi_dir() -> Result<std::path::PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?;
+    Ok(home.join(".vt-yubi"))
+}
+
+fn secrets_index_path() -> Result<std::path::PathBuf> {
+    Ok(vt_yubi_dir()?.join("secrets.json"))
+}
+
+fn load_secrets_index() -> Result<Vec<SecretEntry>> {
+    let path = secrets_index_path()?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let data = std::fs::read_to_string(&path).context("Failed to read secrets index")?;
+    serde_json::from_str(&data).context("Failed to parse secrets index")
+}
+
+fn save_secrets_index(entries: &[SecretEntry]) -> Result<()> {
+    let path = secrets_index_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context("Failed to create ~/.vt-yubi directory")?;
+    }
+    let data = serde_json::to_string_pretty(entries)?;
+    std::fs::write(&path, data).context("Failed to write secrets index")
+}
+
+pub async fn create(
+    vt_client: VTClient,
+    description: Option<String>,
+    file: Option<String>,
+) -> Result<()> {
+    let is_tty = atty::is(atty::Stream::Stdin);
+
+    let (secret_type, secret) = if let Some(file_path) = &file {
+        let content = if file_path == "-" {
+            let mut buf = String::new();
+            io::stdin().read_to_string(&mut buf)?;
+            buf
+        } else {
+            std::fs::read_to_string(file_path)
+                .with_context(|| format!("Failed to read file: {}", file_path))?
+        };
+        let secret = content.trim().to_string();
+        if secret.is_empty() {
+            return Err(anyhow::anyhow!("Secret cannot be empty"));
+        }
+        (SecretType::RAW, secret)
+    } else if !is_tty {
+        let mut buf = String::new();
+        io::stdin().read_to_string(&mut buf)?;
+        let secret = buf.trim().to_string();
+        if secret.is_empty() {
+            return Err(anyhow::anyhow!("Secret cannot be empty"));
+        }
+        (SecretType::RAW, secret)
+    } else {
+        print!("Enter secret type (raw/totp) [default: raw]: ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if input.trim().is_empty() {
+            input = "raw".to_string();
+        }
+        debug!("User input for secret type: '{}'", input);
+        let secret_type = SecretType::from_str(&input.trim().to_lowercase());
+        if secret_type == SecretType::UNKNOWN {
+            return Err(anyhow::anyhow!("Invalid secret type: {}", input));
+        }
+        let secret = prompt_input_password("Enter secret: ", "Secret entered: ")?;
+        (secret_type, secret)
+    };
+
+    let description = match description {
+        Some(d) => d,
+        None if is_tty && file.is_none() => {
+            print!("Enter description (optional): ");
+            io::stdout().flush()?;
+            let mut desc = String::new();
+            io::stdin().read_line(&mut desc)?;
+            desc.trim().to_string()
+        }
+        None => String::new(),
+    };
+
     debug!("User input for secret: '{}'", secret);
 
     let res = vt_client
@@ -241,7 +334,79 @@ pub async fn create(vt_client: VTClient) -> Result<()> {
             res[0].err_message
         ));
     }
-    println!("Created item: {}", res[0].result);
+    let vt_str = &res[0].result;
+    println!("Created item: {}", vt_str);
+
+    if !description.is_empty() {
+        let mut entries = load_secrets_index().unwrap_or_default();
+        entries.push(SecretEntry {
+            description,
+            vt: vt_str.clone(),
+            secret_type: format!("{:?}", secret_type),
+            created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        });
+        save_secrets_index(&entries)?;
+    }
+
+    Ok(())
+}
+
+pub fn list(search: Option<String>) -> Result<()> {
+    let entries = load_secrets_index()?;
+    if entries.is_empty() {
+        println!(
+            "No secrets stored. Use `vt-yubi create -d <description>` to add secrets with descriptions."
+        );
+        return Ok(());
+    }
+
+    let filtered: Vec<&SecretEntry> = match &search {
+        Some(keyword) => {
+            let kw = keyword.to_lowercase();
+            entries
+                .iter()
+                .filter(|e| e.description.to_lowercase().contains(&kw))
+                .collect()
+        }
+        None => entries.iter().collect(),
+    };
+
+    if filtered.is_empty() {
+        println!("No secrets matching \"{}\".", search.unwrap_or_default());
+        return Ok(());
+    }
+
+    for (i, entry) in filtered.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        println!("[{}] {}", i + 1, entry.description);
+        println!(
+            "    Type: {}  Created: {}",
+            entry.secret_type, entry.created_at
+        );
+        println!("    {}", entry.vt);
+    }
+
+    Ok(())
+}
+
+pub fn delete(number: usize) -> Result<()> {
+    let mut entries = load_secrets_index()?;
+    if entries.is_empty() {
+        println!("No secrets stored.");
+        return Ok(());
+    }
+    if number == 0 || number > entries.len() {
+        return Err(anyhow::anyhow!(
+            "Invalid secret number {}. Use `vt-yubi list` to see valid numbers (1-{}).",
+            number,
+            entries.len()
+        ));
+    }
+    let removed = entries.remove(number - 1);
+    save_secrets_index(&entries)?;
+    println!("Deleted secret [{}]: {}", number, removed.description);
     Ok(())
 }
 
@@ -284,7 +449,6 @@ async fn decrypt_from_multi_str(
     command: String,
 ) -> Result<Vec<String>> {
     let mut encrypted_vec = Vec::<String>::new();
-    // Extract 'vt://xxx/urlsafebase64encoded' patterns from the string
     let vt_pattern = regex::Regex::new(r"vt://[^/]+/[A-Za-z0-9_-]+").unwrap();
     for item in &original_str_vec {
         for vt_match in vt_pattern.find_iter(item) {
@@ -315,7 +479,6 @@ async fn decrypt_from_multi_str(
         })
         .collect();
 
-    // Create a mapping from encrypted vault items to decrypted values
     let mut secret_map = std::collections::HashMap::new();
     for (i, encrypted) in encrypted_vec.iter().enumerate() {
         if i < decrypted_vec.len() {
@@ -324,7 +487,6 @@ async fn decrypt_from_multi_str(
     }
     debug!("secret_map: {:?}", secret_map);
 
-    // Replace encrypted vault items with decrypted values in original strings
     let mut result_vec = Vec::new();
     for original_str in original_str_vec {
         let mut result_str = original_str.clone();
@@ -358,7 +520,6 @@ pub async fn inject(
     let original_command = if original_command.is_empty() {
         "[inject]".to_string()
     } else {
-        // Replace newlines and collapse whitespace for cleaner display
         let normalized = regex::Regex::new(r"\s+")
             .unwrap()
             .replace_all(&original_command, " ")
@@ -367,7 +528,6 @@ pub async fn inject(
             .unwrap()
             .replace_all(&normalized, "vt://***")
             .to_string();
-        // Truncate long commands to keep the display readable (UTF-8 safe)
         const MAX_CMD_LEN: usize = 60;
         let truncated = if sanitized.chars().count() > MAX_CMD_LEN {
             let s: String = sanitized.chars().take(MAX_CMD_LEN).collect();
@@ -388,8 +548,6 @@ pub async fn inject(
     };
     args.push(input_file_content);
 
-    // Scan env vars locally for vt:// patterns — only those values enter the
-    // decrypt pipeline. Env var names and non-vt values never leave this process.
     let vt_pattern = regex::Regex::new(r"vt://[^/]+/[A-Za-z0-9_-]+").unwrap();
     let env_vt_vars: Vec<(String, String)> = env::vars()
         .filter(|(_, v)| vt_pattern.is_match(v))
@@ -400,14 +558,12 @@ pub async fn inject(
 
     let mut decrypted_args = decrypt_from_multi_str(vt_client, args, original_command).await?;
 
-    // Pop decrypted env var values (in reverse push order) and set only those.
     for (key, _) in env_vt_vars.iter().rev() {
         let decrypted_value = decrypted_args.pop().unwrap();
         env::set_var(key, decrypted_value);
     }
 
     if let Some(replace_file_path) = &replace_file {
-        // Create a backup of the original file
         let backup_path = format!("{}.vt", replace_file_path);
         std::fs::copy(replace_file_path, &backup_path)
             .with_context(|| format!("Failed to backup file to: {}", backup_path))?;
@@ -427,7 +583,6 @@ pub async fn inject(
         print!("{}", output_file_content);
     }
 
-    // Helper function to restore backup or delete output file
     let restore_backup = |replace_file_path: Option<&String>, output_file_path: Option<&String>| {
         if let Some(replace_file_path) = replace_file_path {
             let backup_path = format!("{}.vt", replace_file_path);
@@ -446,37 +601,26 @@ pub async fn inject(
     };
 
     let cleanup_pid = if timeout > 0 && (output_file.is_some() || replace_file.is_some()) {
-        // Fork the process to handle file deletion in the background.
-        // This is `unsafe` because it can violate Rust's memory safety guarantees,
-        // especially in a multi-threaded context. However, for our simple case
-        // where the child process only sleeps and deletes a file, it's acceptable.
         let pid = unsafe { libc::fork() };
 
         if pid > 0 {
-            // Parent process: Continue to the exec call.
             debug!("Spawned cleanup process with PID: {}", pid);
             Some(pid)
         } else if pid == 0 {
-            // Child process: Sleep, then restore backup or delete output file, and exit.
-            // Using std::thread::sleep instead of tokio::time::sleep is safer after a fork.
             std::thread::sleep(std::time::Duration::from_secs(timeout as u64));
 
             if let Some(replace_file_path) = replace_file.as_ref() {
-                // Restore the backup file
                 let backup_path = format!("{}.vt", replace_file_path);
                 if let Err(e) = std::fs::rename(&backup_path, replace_file_path) {
                     eprintln!("Child process failed to restore backup file: {}", e);
                 }
             } else if let Some(output_file_path) = output_file.as_ref() {
-                // Delete the output file
                 if let Err(e) = std::fs::remove_file(output_file_path) {
                     eprintln!("Child process failed to delete output file: {}", e);
                 }
             }
-            // The child's work is done, it must exit.
             std::process::exit(0);
         } else {
-            // Fork failed.
             return Err(anyhow::anyhow!(
                 "Failed to fork cleanup process: {}",
                 std::io::Error::last_os_error()
@@ -491,47 +635,33 @@ pub async fn inject(
         return Ok(());
     }
 
-    // Execute the command with decrypted arguments
     let command = &decrypted_args[0];
     let args = &decrypted_args[1..];
 
     debug!("Executing command: {} with args: {:?}", command, args);
 
-    // If exec() fails, we need to immediately restore the backup and kill the cleanup child
-    // exec() never returns if successful (it replaces the process), so if we reach the code below,
-    // it means exec() failed
     let err = exec::Command::new(command).args(args).exec();
 
-    // If we reach here, exec() failed - immediately restore backup and kill cleanup child
     if let Some(cleanup_pid) = cleanup_pid {
-        // Kill the cleanup child process immediately since exec failed
         unsafe {
             libc::kill(cleanup_pid, libc::SIGTERM);
         }
-        // Wait for the child to exit to avoid zombie processes
         let mut status = 0;
         unsafe {
             libc::waitpid(cleanup_pid, &mut status, 0);
         }
     }
 
-    // Immediately restore the backup since exec failed
     restore_backup(replace_file.as_ref(), output_file.as_ref());
 
     Err(anyhow::anyhow!("Failed to execute command: {}", err))
 }
 
+#[cfg(feature = "server")]
 pub async fn export_secret() -> Result<()> {
-    if !local_authentication("export master secret") {
-        Err(anyhow::anyhow!(
-            "Local authentication failed for export master secret"
-        ))?;
-    }
-    let (_, passphrase_cipher) = load_passcode_ciphers()?;
-    let encrypted_passphrase = get_keychain("passphrase")?;
-    let decrypted_passphrase = passphrase_cipher
-        .decrypt(&encrypted_passphrase)
-        .context("Failed to decrypt passphrase")?;
+    let (mut yk, _pin) = crate::yk_backend::open_and_verify_pin()?;
+    tracing::info!("Touch YubiKey to decrypt passphrase...");
+    let passphrase = crate::yk_backend::load_passphrase(&mut yk)?;
 
     let master_secret_passphrase = prompt_input_password(
         "Enter master secret passphrase: ",
@@ -543,25 +673,25 @@ pub async fn export_secret() -> Result<()> {
     let export_cipher =
         AesGcmCrypto::new(&key).context("Failed to create AES-GCM cipher for master secret")?;
 
-    let new_encrypted_passphrase_bytes = export_cipher
-        .encrypt(&decrypted_passphrase)
-        .context("Failed to encrypt master secret passphrase")?;
+    let encrypted = export_cipher
+        .encrypt(&passphrase)
+        .context("Failed to encrypt master secret")?;
     println!(
-        "Encrypted master secret passphrase (base64): {}",
-        BASE64_URL_SAFE_NO_PAD.encode(new_encrypted_passphrase_bytes)
+        "Encrypted master secret (base64): {}",
+        BASE64_URL_SAFE_NO_PAD.encode(encrypted)
     );
 
     Ok(())
 }
 
+#[cfg(feature = "server")]
 pub async fn import_secret() -> Result<()> {
-    let passphrase_result = load_passcode_ciphers();
-    if passphrase_result.is_ok() {
-        Err(anyhow::anyhow!(
-            "Error: already imported? Please delete keys in keychain of 'rusty.vault' first"
-        ))?;
-        std::process::exit(1);
+    if crate::yk_backend::load_config().is_ok() {
+        anyhow::bail!(
+            "Already initialized. Delete ~/.vt-yubi to re-initialize."
+        );
     }
+
     let master_secret = prompt_input_password("Enter master secret: ", "Master secret entered: ")?;
     let encrypted_passphrase_bytes = BASE64_URL_SAFE_NO_PAD.decode(master_secret)?;
 
@@ -575,43 +705,22 @@ pub async fn import_secret() -> Result<()> {
     let import_cipher =
         AesGcmCrypto::new(&key).context("Failed to create AES-GCM cipher for master secret")?;
 
-    let vt_path = env::current_exe().unwrap().to_string_lossy().to_string();
-    print!("Enter absolute path of vt (Default: {}): ", vt_path);
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    if input.trim().is_empty() {
-        input = vt_path;
-    } else {
-        input = input.trim().to_string();
-    }
-
-    let real_passphrase = import_cipher.decrypt(&encrypted_passphrase_bytes)?;
-    let passphrase_array: [u8; 32] = real_passphrase
+    let passphrase_bytes = import_cipher.decrypt(&encrypted_passphrase_bytes)?;
+    let passphrase: [u8; 32] = passphrase_bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("Decrypted passphrase must be exactly 32 bytes"))?;
 
-    create_and_save_passcode_passphrase(&passphrase_array, Some(&input))
-        .context("Failed to create and save passcode passphrase")?;
+    // Initialize YubiKey with a new PIV key, then re-encrypt the imported passphrase
+    println!("Now initializing YubiKey PIV key for this device...");
+    let vt_auth = crate::yk_backend::yubikey_init()?;
 
-    Ok(())
-}
+    // Re-encrypt passphrase with the new YubiKey's public key
+    crate::yk_backend::reencrypt_passphrase(&passphrase)?;
 
-pub async fn rotate_passcode(bin_absolute_path: Option<String>) -> Result<()> {
-    if !local_authentication("rotate passcode") {
-        Err(anyhow::anyhow!(
-            "Local authentication failed for rotate passcode"
-        ))?;
-    }
-    let (_, passphrase_cipher) = load_passcode_ciphers()?;
-    let encrypted_passphrase = get_keychain("passphrase")?;
-    let decrypted_passphrase = passphrase_cipher
-        .decrypt(&encrypted_passphrase)
-        .context("Failed to decrypt passphrase. Wrong bin path?")?;
-    let passphrase_array: [u8; 32] = decrypted_passphrase
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Decrypted passphrase must be exactly 32 bytes"))?;
-    create_and_save_passcode_passphrase(&passphrase_array, bin_absolute_path.as_deref())?;
+    println!("\nImport complete!");
+    println!("Export this token to use vt-yubi:");
+    println!("  export VT_AUTH={}", vt_auth);
+
     Ok(())
 }
 
