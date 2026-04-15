@@ -80,7 +80,9 @@ enum Commands {
     },
     /// Decrypt an existing vt protocol as plaintext
     Read {
-        #[arg(help = "A string in vt protocol format, e.g. vt://mac/0xxxx")]
+        #[arg(
+            help = "A vt:// protocol string (e.g. vt://mac/0xxxx), or a number from `vt-yubi list` (e.g. 1)"
+        )]
         vt: String,
     },
     /// Read env/file and decrypt vt protocol, output to output-file or standard output

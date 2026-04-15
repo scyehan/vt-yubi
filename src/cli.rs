@@ -426,7 +426,37 @@ pub async fn auth(vt_client: VTClient, reason: &str) -> Result<()> {
     vt_client.auth(reason).await
 }
 
+/// Resolve the `read` argument: either a `vt://` string (used as-is) or a
+/// decimal index (1-based) into the `vt-yubi list` output, looked up in
+/// `secrets.json`.
+fn resolve_read_target(input: &str) -> Result<String> {
+    if input.starts_with("vt://") {
+        return Ok(input.to_string());
+    }
+    if let Ok(n) = input.parse::<usize>() {
+        let entries = load_secrets_index()?;
+        if entries.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No secrets indexed. Use `vt-yubi create -d <description>` to add one."
+            ));
+        }
+        if n == 0 || n > entries.len() {
+            return Err(anyhow::anyhow!(
+                "Invalid secret number {}. Use `vt-yubi list` to see valid numbers (1-{}).",
+                n,
+                entries.len()
+            ));
+        }
+        return Ok(entries[n - 1].vt.clone());
+    }
+    Err(anyhow::anyhow!(
+        "Expected a vt:// string or a number shown by `vt-yubi list` (got: {})",
+        input
+    ))
+}
+
 pub async fn read(vt_client: VTClient, vt: String) -> Result<()> {
+    let vt = resolve_read_target(&vt)?;
     let req = DecryptReq {
         host: get_hostname(),
         command: "[read]".to_string(),
