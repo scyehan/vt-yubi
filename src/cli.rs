@@ -92,7 +92,16 @@ impl VTClient {
         use std::os::unix::net::UnixStream;
 
         let socket_path = if let Ok(sock) = std::env::var("SSH_AUTH_SOCK") {
-            std::path::PathBuf::from(sock)
+            let path = std::path::PathBuf::from(&sock);
+            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if filename != "vt-yubi.sock" {
+                return Err(anyhow::anyhow!(
+                    "SSH_AUTH_SOCK is set to '{}', but vt-yubi requires 'vt-yubi.sock'. \
+                     Run `export SSH_AUTH_SOCK=~/.ssh/vt-yubi.sock` or source ~/.vt-yubi/env.sh",
+                    sock
+                ));
+            }
+            path
         } else {
             let home =
                 dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home dir"))?;
@@ -455,8 +464,9 @@ fn resolve_read_target(input: &str) -> Result<String> {
     ))
 }
 
-pub async fn read(vt_client: VTClient, vt: String) -> Result<()> {
+pub async fn read(vt_client: VTClient, vt: String, copy: bool) -> Result<()> {
     let vt = resolve_read_target(&vt)?;
+    let is_totp = vt.starts_with("vt://mac/1");
     let req = DecryptReq {
         host: get_hostname(),
         command: "[read]".to_string(),
@@ -469,7 +479,24 @@ pub async fn read(vt_client: VTClient, vt: String) -> Result<()> {
         "Error decrypting item: {}",
         res[0].err_message
     );
-    print!("{}", res[0].result);
+    let result = &res[0].result;
+    if copy && is_totp {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .context("Failed to spawn pbcopy")?;
+        child
+            .stdin
+            .as_mut()
+            .context("Failed to open pbcopy stdin")?
+            .write_all(result.as_bytes())
+            .context("Failed to write to pbcopy")?;
+        child.wait().context("pbcopy failed")?;
+        println!("{} (copied to clipboard)", result);
+    } else {
+        print!("{}", result);
+    }
     Ok(())
 }
 

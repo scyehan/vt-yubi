@@ -84,6 +84,9 @@ enum Commands {
             help = "A vt:// protocol string (e.g. vt://mac/0xxxx), or a number from `vt-yubi list` (e.g. 1)"
         )]
         vt: String,
+
+        #[arg(short = 'c', long, help = "Copy TOTP code to clipboard (macOS only)")]
+        copy: bool,
     },
     /// Read env/file and decrypt vt protocol, output to output-file or standard output
     Inject {
@@ -316,10 +319,10 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::List { search } => cli::list(search.clone()),
         Commands::Delete { number } => cli::delete(*number),
-        Commands::Read { vt } => {
+        Commands::Read { vt, copy } => {
             let auth = require_auth(&cli.auth)?;
             let vt_client = VTClient::new(cli.addr.clone(), auth);
-            cli::read(vt_client, vt.to_string()).await
+            cli::read(vt_client, vt.to_string(), *copy).await
         }
         Commands::Auth { reason } => {
             let auth = require_auth(&cli.auth)?;
