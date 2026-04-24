@@ -8,6 +8,8 @@ fn require_auth(auth: &Option<String>) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("VT_AUTH not set — run `vt-yubi init` and export the token"))
 }
 
+#[cfg(feature = "server")]
+mod audit;
 mod cli;
 mod core;
 mod security;

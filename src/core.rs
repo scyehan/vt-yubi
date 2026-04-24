@@ -16,6 +16,10 @@ pub struct DecryptReq {
     pub host: String,
     pub command: String,
     pub items: Vec<String>,
+    /// Optional human-readable labels for each item (same length as `items`), for display in the
+    /// Touch ID / YubiKey prompt. Empty or missing entries fall back to a count.
+    #[serde(default)]
+    pub descriptions: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize)]

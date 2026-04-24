@@ -295,6 +295,98 @@ mod proc_info {
     pub fn get_process_name(pid: i32) -> Option<String> {
         get_proc_path(pid).and_then(|p| p.rsplit('/').next().map(String::from))
     }
+
+    /// Describe the caller process for display in YubiKey prompts.
+    /// Walks up from `peer_pid` past any `vt-yubi` frames (local CLI is typically the direct peer)
+    /// so the user sees the real invoker (shell, script, app, `sshd` for forwarded agents).
+    /// Returns `"name (PID N)"` or an empty string if nothing can be resolved.
+    pub fn describe_caller(peer_pid: i32) -> String {
+        let mut current = peer_pid;
+        for _ in 0..8 {
+            if current <= 1 {
+                break;
+            }
+            if let Some(path) = get_proc_path(current) {
+                let name = path.rsplit('/').next().unwrap_or(&path);
+                if !name.is_empty() && name != "vt-yubi" {
+                    return format!("{} (PID {})", name, current);
+                }
+            }
+            match get_proc_bsdinfo(current) {
+                Some((ppid, _)) if ppid > 0 && ppid as i32 != current => {
+                    current = ppid as i32;
+                }
+                _ => break,
+            }
+        }
+        String::new()
+    }
+}
+
+// --- Touch ID / YubiKey prompt formatting ---
+
+/// Sanitize an untrusted string for display in a prompt:
+/// strip control chars and truncate to `max_chars` (character-count, UTF-8 safe).
+fn sanitize_for_prompt(s: &str, max_chars: usize) -> String {
+    s.chars().filter(|c| !c.is_control()).take(max_chars).collect()
+}
+
+/// Format the items portion of a decrypt prompt. Uses per-item descriptions when any are present,
+/// otherwise falls back to a count.
+fn format_items_label(items_len: usize, descriptions: &[String]) -> String {
+    const MAX_LABEL_CHARS: usize = 40;
+    const MAX_LABELS_SHOWN: usize = 3;
+    let labels: Vec<String> = descriptions
+        .iter()
+        .filter(|d| !d.is_empty())
+        .map(|d| sanitize_for_prompt(d, MAX_LABEL_CHARS))
+        .collect();
+    if labels.is_empty() {
+        return if items_len == 1 {
+            "1 item".to_string()
+        } else {
+            format!("{} items", items_len)
+        };
+    }
+    let shown = labels.len().min(MAX_LABELS_SHOWN);
+    let more = items_len.saturating_sub(shown);
+    let joined = labels
+        .iter()
+        .take(shown)
+        .map(|l| format!("`{}`", l))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if more > 0 {
+        format!("{} (+{} more)", joined, more)
+    } else {
+        joined
+    }
+}
+
+/// Build the YubiKey prompt text for a `decrypt@vt` / HTTP `/decrypt` request.
+/// `caller` comes from `proc_info::describe_caller(peer_pid)`; pass `""` when unavailable.
+pub fn format_decrypt_prompt(req: &crate::core::DecryptReq, caller: &str) -> String {
+    let host = sanitize_for_prompt(&req.host, 100);
+    let command = sanitize_for_prompt(&req.command, 200);
+    let items_label = format_items_label(req.items.len(), &req.descriptions);
+    let caller_part = if caller.is_empty() {
+        String::new()
+    } else {
+        format!(" by {}", caller)
+    };
+    format!("decrypt {} from {}{} to run `{}`", items_label, host, caller_part, command,)
+}
+
+/// Build the YubiKey prompt text for an `auth@vt` request.
+pub fn format_auth_prompt(req: &crate::core::AuthReq, caller: &str) -> String {
+    let reason = sanitize_for_prompt(&req.reason, 100);
+    let host = sanitize_for_prompt(&req.host, 100);
+    let caller_part = if caller.is_empty() {
+        String::new()
+    } else {
+        format!(" via {}", caller)
+    };
+    format!("bio auth: {} from {}{}", reason, host, caller_part)
 }
 
 // --- SSH Agent ---
@@ -600,6 +692,10 @@ impl Session for VtSshSession {
             .peer_pid
             .and_then(proc_info::get_process_name)
             .unwrap_or_default();
+        let caller = self
+            .peer_pid
+            .map(proc_info::describe_caller)
+            .unwrap_or_default();
         let key_label = if comment.is_empty() {
             fp_str.clone()
         } else {
@@ -611,10 +707,18 @@ impl Session for VtSshSession {
             format!("SSH sign: {} by {}", key_label, proc_name)
         };
 
-        if !self
+        let approved = self
             .check_or_prompt_auth(&fp_str, &auth_message, false)
-            .await
-        {
+            .await;
+        crate::audit::log_sign(
+            self.peer_pid,
+            &proc_name,
+            &caller,
+            &key_label,
+            &fp_str,
+            approved,
+        );
+        if !approved {
             tracing::debug!("YubiKey auth failed for {}", fp_str);
             return Err(AgentError::Failure);
         }
@@ -693,10 +797,16 @@ impl Session for VtSshSession {
                 AgentError::Failure
             })?;
 
+        let caller = self
+            .peer_pid
+            .map(proc_info::describe_caller)
+            .unwrap_or_default();
+
         let response_bytes = match extension.name.as_str() {
             "encrypt@vt" => {
                 let items: Vec<EncryptItem> =
                     serde_json::from_slice(&decrypted).map_err(|e| agent_err(e.into()))?;
+                crate::audit::log_encrypt(self.peer_pid, &caller, items.len());
                 let mac_cipher = AesGcmCrypto::new(&self.passphrase).map_err(agent_err)?;
                 let result: Vec<CryptoResItem> = do_encrypt(&mac_cipher, items);
                 serde_json::to_vec(&result).map_err(|e| agent_err(e.into()))?
@@ -704,16 +814,12 @@ impl Session for VtSshSession {
             "decrypt@vt" => {
                 let req: DecryptReq =
                     serde_json::from_slice(&decrypted).map_err(|e| agent_err(e.into()))?;
-                let local_auth_message = format!(
-                    "decrypt {} items from {} to run `{}`",
-                    req.items.len(),
-                    req.host,
-                    req.command,
-                );
-                if !self
+                let local_auth_message = format_decrypt_prompt(&req, &caller);
+                let approved = self
                     .check_or_prompt_auth("decrypt@vt", &local_auth_message, true)
-                    .await
-                {
+                    .await;
+                crate::audit::log_decrypt(self.peer_pid, &caller, &req, approved);
+                if !approved {
                     return Err(AgentError::Failure);
                 }
                 let mac_cipher = AesGcmCrypto::new(&self.passphrase).map_err(agent_err)?;
@@ -723,17 +829,12 @@ impl Session for VtSshSession {
             "auth@vt" => {
                 let req: AuthReq =
                     serde_json::from_slice(&decrypted).map_err(|e| agent_err(e.into()))?;
-
-                let sanitize = |s: &str| -> String {
-                    s.chars().filter(|c| !c.is_control()).take(100).collect()
-                };
-                let reason = sanitize(&req.reason);
-                let host = sanitize(&req.host);
-
-                let auth_message = format!("bio auth: {} from {}", reason, host);
+                let auth_message = format_auth_prompt(&req, &caller);
 
                 // Always require YubiKey touch — no caching for auth@vt
-                if !self.verify_yubikey_presence(&auth_message) {
+                let approved = self.verify_yubikey_presence(&auth_message);
+                crate::audit::log_auth(self.peer_pid, &caller, &req, approved);
+                if !approved {
                     return Err(AgentError::Failure);
                 }
 

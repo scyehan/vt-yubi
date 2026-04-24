@@ -208,15 +208,14 @@ async fn handler_decrypt(
     State(state): State<AppState>,
     Json(payload): Json<DecryptReq>,
 ) -> impl IntoResponse {
-    let local_auth_message = format!(
-        "decrypt {} items from {} to run `{}`",
-        payload.items.len(),
-        payload.host,
-        payload.command,
-    );
+    // HTTP path: no peer PID available, so caller is empty.
+    let local_auth_message = crate::ssh_agent::format_decrypt_prompt(&payload, "");
 
     // YubiKey presence check for HTTP decrypt (uses cached PIN)
-    if !yk_backend::verify_presence_with_pin(&state.pin, &local_auth_message).unwrap_or(false) {
+    let approved =
+        yk_backend::verify_presence_with_pin(&state.pin, &local_auth_message).unwrap_or(false);
+    crate::audit::log_decrypt(None, "", &payload, approved);
+    if !approved {
         return (StatusCode::FORBIDDEN, "User Rejected").into_response();
     }
 
@@ -234,6 +233,7 @@ async fn handler_encrypt(
     State(state): State<AppState>,
     Json(payload): Json<Vec<EncryptItem>>,
 ) -> impl IntoResponse {
+    crate::audit::log_encrypt(None, "", payload.len());
     match AesGcmCrypto::new(&state.passphrase) {
         Ok(cipher) => Json(do_encrypt(&cipher, payload)).into_response(),
         Err(_) => (

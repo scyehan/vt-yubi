@@ -471,6 +471,7 @@ pub async fn read(vt_client: VTClient, vt: String, copy: bool) -> Result<()> {
         host: get_hostname(),
         command: "[read]".to_string(),
         items: vec![vt],
+        descriptions: vec![],
     };
     let res = vt_client.decrypt(&req).await?;
     ensure!(res.len() == 1, "Expected exactly one item in response");
@@ -519,6 +520,7 @@ async fn decrypt_from_multi_str(
             host: get_hostname(),
             command: command,
             items: encrypted_vec.clone(),
+            descriptions: vec![],
         })
         .await?;
     ensure!(
